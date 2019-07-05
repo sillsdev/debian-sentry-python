@@ -1,0 +1,3 @@
+.pytest_cache/*.md
+.pytest_cache/v/cache/*
+sentry_sdk.egg-info/*

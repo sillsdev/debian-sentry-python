@@ -1,0 +1,5 @@
+sentry-python (0.9.5-1) experimental; urgency=medium
+
+  * Initial release (Closes: #931461)
+
+ -- William Grzybowski <william@grzy.org>  Thu, 04 Jul 2019 21:10:34 -0300

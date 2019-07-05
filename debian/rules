@@ -1,0 +1,24 @@
+#!/usr/bin/make -f
+#export DH_VERBOSE = 1
+
+export PYBUILD_NAME=sentry_sdk
+# Disable tests failing mostly because of internet access (httpbin.org)
+export PYBUILD_TEST_ARGS=-k '\
+	not test_basic and \
+	not test_403_not_captured and \
+	not test_half_initialized and \
+	not test_httplib_misuse and \
+	not test_crumb_capture and \
+	not test_errors and \
+        not test_proxy_bothselect_httpenv and \
+	not test_proxy_httpselect_httpsenv and \
+	not test_proxy_none_noenv and \
+	not test_proxy_http_fallback_http and \
+	not test_proxy_none_httpenv_fallback and \
+	not test_transport_works \
+	'
+# Remove directory created while running tests on build
+export PYBUILD_AFTER_INSTALL_python3=rm -rf {destdir}/usr/lib/python3.7/dist-packages/.hypothesis
+
+%:
+	dh $@ --with python3 --buildsystem=pybuild
