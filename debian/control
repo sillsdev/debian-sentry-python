@@ -15,7 +15,7 @@ Build-Depends: debhelper-compat (= 12),
                python3-pytest-xdist,
                python3-urllib3,
                python3-werkzeug
-Standards-Version: 4.3.0
+Standards-Version: 4.4.0
 Homepage: https://github.com/getsentry/sentry-python
 Vcs-Browser: https://salsa.debian.org/wg-guest/sentry-python
 Vcs-Git: https://salsa.debian.org/wg-guest/sentry-python.git
