@@ -1,7 +1,9 @@
 sentry-python (0.9.5-2) unstable; urgency=medium
 
   * Upload to unstable
-  * d/control: update Standards-Version to 4.4.0
+  * d/control:
+     - Change Vcs-* to DPMT
+     - Update Standards-Version to 4.4.0
   * d/gbp.conf: no longer needed in DPMT repository
   * d/rules: do not hard-code python version
 
