@@ -1,3 +1,9 @@
+sentry-python (0.9.5-2) unstable; urgency=medium
+
+  * Upload to unstable
+
+ -- William Grzybowski <william@grzy.org>  Mon, 16 Sep 2019 10:56:44 -0300
+
 sentry-python (0.9.5-1) experimental; urgency=medium
 
   * Initial release (Closes: #931461)
