@@ -2,6 +2,7 @@ import pytest
 import json
 
 from werkzeug.test import Client
+from django import VERSION as DJANGO_VERSION
 from django.contrib.auth.models import User
 from django.core.management import execute_from_command_line
 from django.db.utils import OperationalError, ProgrammingError, DataError
@@ -56,7 +57,7 @@ def test_request_captured(sentry_init, client, capture_events):
     assert event["request"] == {
         "cookies": {},
         "env": {"SERVER_NAME": "localhost", "SERVER_PORT": "80"},
-        "headers": {"Content-Length": "0", "Content-Type": "", "Host": "localhost"},
+        "headers": {"Host": "localhost"},
         "method": "GET",
         "query_string": "",
         "url": "http://localhost/message",
@@ -135,7 +136,7 @@ def test_custom_error_handler_request_context(sentry_init, client, capture_event
     assert event["level"] == "error"
     assert event["request"] == {
         "env": {"SERVER_NAME": "localhost", "SERVER_PORT": "80"},
-        "headers": {"Content-Length": "0", "Content-Type": "", "Host": "localhost"},
+        "headers": {"Host": "localhost"},
         "method": "POST",
         "query_string": "",
         "url": "http://localhost/404",
@@ -164,8 +165,12 @@ def test_management_command_raises():
 
 
 @pytest.mark.django_db
-def test_sql_queries(sentry_init, capture_events):
-    sentry_init(integrations=[DjangoIntegration()], send_default_pii=True)
+@pytest.mark.parametrize("with_integration", [True, False])
+def test_sql_queries(sentry_init, capture_events, with_integration):
+    sentry_init(
+        integrations=[DjangoIntegration()] if with_integration else [],
+        send_default_pii=True,
+    )
     from django.db import connection
 
     sql = connection.cursor()
@@ -179,9 +184,11 @@ def test_sql_queries(sentry_init, capture_events):
 
     event, = events
 
-    crumb = event["breadcrumbs"][-1]
+    if with_integration:
+        crumb = event["breadcrumbs"][-1]
 
-    assert crumb["message"] == """SELECT count(*) FROM people_person WHERE foo = 123"""
+        assert crumb["message"] == "SELECT count(*) FROM people_person WHERE foo = %s"
+        assert crumb["data"]["db.params"] == [123]
 
 
 @pytest.mark.django_db
@@ -205,8 +212,11 @@ def test_sql_dict_query_params(sentry_init, capture_events):
     capture_message("HI")
     event, = events
 
-    crumb, = event["breadcrumbs"]
-    assert crumb["message"] == ("SELECT count(*) FROM people_person WHERE foo = 10")
+    crumb = event["breadcrumbs"][-1]
+    assert crumb["message"] == (
+        "SELECT count(*) FROM people_person WHERE foo = %(my_foo)s"
+    )
+    assert crumb["data"]["db.params"] == {"my_foo": 10}
 
 
 @pytest.mark.parametrize(
@@ -237,8 +247,9 @@ def test_sql_psycopg2_string_composition(sentry_init, capture_events, query):
     capture_message("HI")
 
     event, = events
-    crumb, = event["breadcrumbs"]
-    assert crumb["message"] == ('SELECT 10 FROM "foobar"')
+    crumb = event["breadcrumbs"][-1]
+    assert crumb["message"] == ('SELECT %(my_param)s FROM "foobar"')
+    assert crumb["data"]["db.params"] == {"my_param": 10}
 
 
 @pytest.mark.django_db
@@ -271,37 +282,27 @@ def test_sql_psycopg2_placeholders(sentry_init, capture_events):
     capture_message("HI")
 
     event, = events
-    crumb1, crumb2 = event["breadcrumbs"]
-    assert crumb1["message"] == ("create table my_test_table (foo text, bar date)")
-    assert crumb2["message"] == (
-        """insert into my_test_table ("foo", "bar") values ('fizz', 'not a date')"""
-    )
+    for crumb in event["breadcrumbs"]:
+        del crumb["timestamp"]
 
-
-@pytest.mark.django_db
-def test_sql_queries_large_params(sentry_init, capture_events):
-    sentry_init(integrations=[DjangoIntegration()], send_default_pii=True)
-    from django.db import connection
-
-    sql = connection.cursor()
-
-    events = capture_events()
-    with pytest.raises(OperationalError):
-        # table doesn't even exist
-        sql.execute(
-            """SELECT count(*) FROM people_person WHERE foo = %s and bar IS NULL""",
-            ["x" * 1000],
-        )
-
-    capture_message("HI")
-
-    event, = events
-
-    crumb = event["breadcrumbs"][-1]
-    assert crumb["message"] == (
-        "SELECT count(*) FROM people_person WHERE foo = '%s... and bar IS NULL"
-        % ("x" * 124,)
-    )
+    assert event["breadcrumbs"][-2:] == [
+        {
+            "category": "query",
+            "data": {"db.paramstyle": "format"},
+            "message": "create table my_test_table (foo text, bar date)",
+            "type": "default",
+        },
+        {
+            "category": "query",
+            "data": {
+                "db.params": {"first_var": "fizz", "second_var": "not a date"},
+                "db.paramstyle": "format",
+            },
+            "message": 'insert into my_test_table ("foo", "bar") values (%(first_var)s, '
+            "%(second_var)s)",
+            "type": "default",
+        },
+    ]
 
 
 @pytest.mark.parametrize(
@@ -479,3 +480,65 @@ def test_rest_framework_basic(
     assert event["exception"]["values"][0]["mechanism"]["type"] == "django"
 
     assert event["request"] == event_request(route)
+
+
+@pytest.mark.parametrize(
+    "endpoint", ["rest_permission_denied_exc", "permission_denied_exc"]
+)
+def test_does_not_capture_403(sentry_init, client, capture_events, endpoint):
+    if endpoint == "rest_permission_denied_exc":
+        pytest.importorskip("rest_framework")
+
+    sentry_init(integrations=[DjangoIntegration()])
+    events = capture_events()
+
+    _content, status, _headers = client.get(reverse(endpoint))
+    assert status.lower() == "403 forbidden"
+
+    assert not events
+
+
+def test_middleware_spans(sentry_init, client, capture_events):
+    sentry_init(integrations=[DjangoIntegration()], traces_sample_rate=1.0)
+    events = capture_events()
+
+    _content, status, _headers = client.get(reverse("message"))
+
+    message, transaction = events
+
+    assert message["message"] == "hi"
+
+    for middleware in transaction["spans"]:
+        assert middleware["op"] == "django.middleware"
+
+    if DJANGO_VERSION >= (1, 10):
+        reference_value = [
+            "tests.integrations.django.myapp.settings.TestMiddleware.__call__",
+            "django.contrib.auth.middleware.AuthenticationMiddleware.__call__",
+            "django.contrib.sessions.middleware.SessionMiddleware.__call__",
+        ]
+    else:
+        reference_value = [
+            "django.contrib.sessions.middleware.SessionMiddleware.process_request",
+            "django.contrib.auth.middleware.AuthenticationMiddleware.process_request",
+            "tests.integrations.django.myapp.settings.TestMiddleware.process_request",
+            "tests.integrations.django.myapp.settings.TestMiddleware.process_response",
+            "django.contrib.sessions.middleware.SessionMiddleware.process_response",
+        ]
+
+    assert [t["description"] for t in transaction["spans"]] == reference_value
+
+
+def test_middleware_spans_disabled(sentry_init, client, capture_events):
+    sentry_init(
+        integrations=[DjangoIntegration(middleware_spans=False)], traces_sample_rate=1.0
+    )
+    events = capture_events()
+
+    _content, status, _headers = client.get(reverse("message"))
+
+    message, transaction = events
+
+    assert message["message"] == "hi"
+
+    assert not transaction["spans"]

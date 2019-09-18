@@ -8,14 +8,14 @@ import weakref
 from django import VERSION as DJANGO_VERSION  # type: ignore
 from django.core import signals  # type: ignore
 
-MYPY = False
+from sentry_sdk._types import MYPY
+from sentry_sdk.utils import HAS_REAL_CONTEXTVARS
+
 if MYPY:
     from typing import Any
     from typing import Callable
     from typing import Dict
-    from typing import List
     from typing import Optional
-    from typing import Tuple
     from typing import Union
 
     from django.core.handlers.wsgi import WSGIRequest  # type: ignore
@@ -24,7 +24,7 @@ if MYPY:
     from django.utils.datastructures import MultiValueDict  # type: ignore
 
     from sentry_sdk.integrations.wsgi import _ScopedResponse
-    from sentry_sdk.utils import Event, Hint
+    from sentry_sdk._types import Event, Hint
 
 
 try:
@@ -36,11 +36,10 @@ from sentry_sdk import Hub
 from sentry_sdk.hub import _should_send_default_pii
 from sentry_sdk.scope import add_global_event_processor
 from sentry_sdk.serializer import add_global_repr_processor
+from sentry_sdk.tracing import record_sql_queries
 from sentry_sdk.utils import (
     capture_internal_exceptions,
     event_from_exception,
-    safe_repr,
-    format_and_strip,
     transaction_from_function,
     walk_exception_chain,
 )
@@ -50,6 +49,7 @@ from sentry_sdk.integrations.wsgi import SentryWsgiMiddleware
 from sentry_sdk.integrations._wsgi_common import RequestExtractor
 from sentry_sdk.integrations.django.transactions import LEGACY_RESOLVER
 from sentry_sdk.integrations.django.templates import get_template_frame_from_exception
+from sentry_sdk.integrations.django.middleware import patch_django_middlewares
 
 
 if DJANGO_VERSION < (1, 10):
@@ -70,9 +70,10 @@ class DjangoIntegration(Integration):
     identifier = "django"
 
     transaction_style = None
+    middleware_spans = None
 
-    def __init__(self, transaction_style="url"):
-        # type: (str) -> None
+    def __init__(self, transaction_style="url", middleware_spans=True):
+        # type: (str, bool) -> None
         TRANSACTION_STYLE_VALUES = ("function_name", "url")
         if transaction_style not in TRANSACTION_STYLE_VALUES:
             raise ValueError(
@@ -80,6 +81,7 @@ class DjangoIntegration(Integration):
                 % (transaction_style, TRANSACTION_STYLE_VALUES)
             )
         self.transaction_style = transaction_style
+        self.middleware_spans = middleware_spans
 
     @staticmethod
     def setup_once():
@@ -100,9 +102,9 @@ class DjangoIntegration(Integration):
             if Hub.current.get_integration(DjangoIntegration) is None:
                 return old_app(self, environ, start_response)
 
-            return SentryWsgiMiddleware(lambda *a, **kw: old_app(self, *a, **kw))(
-                environ, start_response
-            )
+            bound_old_app = old_app.__get__(self, WSGIHandler)
+
+            return SentryWsgiMiddleware(bound_old_app)(environ, start_response)
 
         WSGIHandler.__call__ = sentry_patched_wsgi_handler
 
@@ -120,6 +122,17 @@ class DjangoIntegration(Integration):
                 _patch_drf()
 
                 with hub.configure_scope() as scope:
+                    # Rely on WSGI middleware to start a trace
+                    try:
+                        if integration.transaction_style == "function_name":
+                            scope.transaction = transaction_from_function(
+                                resolve(request.path).func
+                            )
+                        elif integration.transaction_style == "url":
+                            scope.transaction = LEGACY_RESOLVER.resolve(request.path)
+                    except Exception:
+                        pass
+
                     scope.add_event_processor(
                         _make_event_processor(weakref.ref(request), integration)
                     )
@@ -199,6 +212,9 @@ class DjangoIntegration(Integration):
                 id(value),
             )
 
+        _patch_channels()
+        patch_django_middlewares()
+
 
 _DRF_PATCHED = False
 _DRF_PATCH_LOCK = threading.Lock()
@@ -257,6 +273,38 @@ def _patch_drf():
                 APIView.initial = sentry_patched_drf_initial
 
 
+def _patch_channels():
+    try:
+        from channels.http import AsgiHandler  # type: ignore
+    except ImportError:
+        return
+
+    if not HAS_REAL_CONTEXTVARS:
+        # We better have contextvars or we're going to leak state between
+        # requests.
+        raise RuntimeError(
+            "We detected that you are using Django channels 2.0. To get proper "
+            "instrumentation for ASGI requests, the Sentry SDK requires "
+            "Python 3.7+ or the aiocontextvars package from PyPI."
+        )
+
+    from sentry_sdk.integrations.asgi import SentryAsgiMiddleware
+
+    old_app = AsgiHandler.__call__
+
+    def sentry_patched_asgi_handler(self, receive, send):
+        if Hub.current.get_integration(DjangoIntegration) is None:
+            return old_app(receive, send)
+
+        middleware = SentryAsgiMiddleware(
+            lambda _scope: old_app.__get__(self, AsgiHandler)
+        )
+
+        return middleware(self.scope)(receive, send)
+
+    AsgiHandler.__call__ = sentry_patched_asgi_handler
+
+
 def _make_event_processor(weak_request, integration):
     # type: (Callable[[], WSGIRequest], DjangoIntegration) -> Callable
     def event_processor(event, hint):
@@ -273,16 +321,6 @@ def _make_event_processor(weak_request, integration):
             if drf_request is not None:
                 request = drf_request
         except AttributeError:
-            pass
-
-        try:
-            if integration.transaction_style == "function_name":
-                event["transaction"] = transaction_from_function(
-                    resolve(request.path).func
-                )
-            elif integration.transaction_style == "url":
-                event["transaction"] = LEGACY_RESOLVER.resolve(request.path)
-        except Exception:
             pass
 
         with capture_internal_exceptions():
@@ -370,81 +408,6 @@ def _set_user_info(request, event):
         pass
 
 
-class _FormatConverter(object):
-    def __init__(self, param_mapping):
-        # type: (Dict[str, int]) -> None
-
-        self.param_mapping = param_mapping
-        self.params = []  # type: List[Any]
-
-    def __getitem__(self, val):
-        # type: (str) -> str
-        self.params.append(self.param_mapping.get(val))
-        return "%s"
-
-
-def format_sql(sql, params):
-    # type: (Any, Any) -> Tuple[str, List[str]]
-    rv = []
-
-    if isinstance(params, dict):
-        # convert sql with named parameters to sql with unnamed parameters
-        conv = _FormatConverter(params)
-        if params:
-            sql = sql % conv
-            params = conv.params
-        else:
-            params = ()
-
-    for param in params or ():
-        if param is None:
-            rv.append("NULL")
-        param = safe_repr(param)
-        rv.append(param)
-
-    return sql, rv
-
-
-def record_sql(sql, params, cursor=None):
-    # type: (Any, Any, Any) -> None
-    hub = Hub.current
-    if hub.get_integration(DjangoIntegration) is None:
-        return
-
-    real_sql = None
-    real_params = None
-
-    try:
-        # Prefer our own SQL formatting logic because it's the only one that
-        # has proper value trimming.
-        real_sql, real_params = format_sql(sql, params)
-        if real_sql:
-            real_sql = format_and_strip(real_sql, real_params)
-    except Exception:
-        pass
-
-    if not real_sql and cursor and hasattr(cursor, "mogrify"):
-        # If formatting failed and we're using psycopg2, it could be that we're
-        # looking at a query that uses Composed objects. Use psycopg2's mogrify
-        # function to format the query. We lose per-parameter trimming but gain
-        # accuracy in formatting.
-        #
-        # This is intentionally the second choice because we assume Composed
-        # queries are not widely used, while per-parameter trimming is
-        # generally highly desirable.
-        try:
-            if cursor and hasattr(cursor, "mogrify"):
-                real_sql = cursor.mogrify(sql, params)
-                if isinstance(real_sql, bytes):
-                    real_sql = real_sql.decode(cursor.connection.encoding)
-        except Exception:
-            pass
-
-    if real_sql:
-        with capture_internal_exceptions():
-            hub.add_breadcrumb(message=real_sql, category="query")
-
-
 def install_sql_hook():
     # type: () -> None
     """If installed this causes Django's queries to be captured."""
@@ -460,21 +423,25 @@ def install_sql_hook():
         # This won't work on Django versions < 1.6
         return
 
-    def record_many_sql(sql, param_list, cursor):
-        for params in param_list:
-            record_sql(sql, params, cursor)
-
     def execute(self, sql, params=None):
-        try:
+        hub = Hub.current
+        if hub.get_integration(DjangoIntegration) is None:
             return real_execute(self, sql, params)
-        finally:
-            record_sql(sql, params, self.cursor)
+
+        with record_sql_queries(
+            hub, self.cursor, sql, params, paramstyle="format", executemany=False
+        ):
+            return real_execute(self, sql, params)
 
     def executemany(self, sql, param_list):
-        try:
+        hub = Hub.current
+        if hub.get_integration(DjangoIntegration) is None:
             return real_executemany(self, sql, param_list)
-        finally:
-            record_many_sql(sql, param_list, self.cursor)
+
+        with record_sql_queries(
+            hub, self.cursor, sql, param_list, paramstyle="format", executemany=True
+        ):
+            return real_executemany(self, sql, param_list)
 
     CursorWrapper.execute = execute
     CursorWrapper.executemany = executemany

@@ -1,3 +1,6 @@
+import platform
+import sys
+
 import pytest
 
 try:
@@ -62,6 +65,9 @@ def test_crumb_capture_hint(sentry_init, capture_events):
         "reason": "OK",
         "extra": "foo",
     }
+
+    if platform.python_implementation() != "PyPy":
+        assert sys.getrefcount(response) == 2
 
 
 def test_httplib_misuse(sentry_init, capture_events):

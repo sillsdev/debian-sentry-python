@@ -1,21 +1,12 @@
 # coding: utf-8
 import json
-import logging
 import pytest
 import subprocess
 import sys
 import time
 
-from datetime import datetime
 from textwrap import dedent
-from sentry_sdk import (
-    Hub,
-    Client,
-    configure_scope,
-    capture_message,
-    add_breadcrumb,
-    capture_exception,
-)
+from sentry_sdk import Hub, Client, configure_scope, capture_message, capture_exception
 from sentry_sdk.hub import HubMeta
 from sentry_sdk.transport import Transport
 from sentry_sdk._compat import reraise, text_type, PY2
@@ -359,28 +350,6 @@ def test_configure_scope_unavailable(no_sdk, monkeypatch):
     assert not calls
 
 
-@pytest.mark.parametrize("debug", (True, False))
-def test_transport_works(httpserver, request, capsys, caplog, debug):
-    httpserver.serve_content("ok", 200)
-    caplog.set_level(logging.DEBUG)
-
-    client = Client(
-        "http://foobar@{}/123".format(httpserver.url[len("http://") :]), debug=debug
-    )
-    Hub.current.bind_client(client)
-    request.addfinalizer(lambda: Hub.current.bind_client(None))
-
-    add_breadcrumb(level="info", message="i like bread", timestamp=datetime.now())
-    capture_message("löl")
-    client.close()
-
-    out, err = capsys.readouterr()
-    assert not err and not out
-    assert httpserver.requests
-
-    assert any("Sending info event" in record.msg for record in caplog.records) == debug
-
-
 @pytest.mark.tests_internal_exceptions
 def test_client_debug_option_enabled(sentry_init, caplog):
     sentry_init(debug=True)
@@ -588,6 +557,68 @@ def test_broken_mapping(sentry_init, capture_events):
     assert (
         event["exception"]["values"][0]["stacktrace"]["frames"][0]["vars"]["a"]
         == "<failed to serialize, use init(debug=True) to see error logs>"
+    )
+
+
+def test_mapping_sends_exception(sentry_init, capture_events):
+    sentry_init()
+    events = capture_events()
+
+    class C(Mapping):
+        def __iter__(self):
+            try:
+                1 / 0
+            except ZeroDivisionError:
+                capture_exception()
+            yield "hi"
+
+        def __len__(self):
+            """List length"""
+            return 1
+
+        def __getitem__(self, ii):
+            """Get a list item"""
+            if ii == "hi":
+                return "hi"
+
+            raise KeyError()
+
+    try:
+        a = C()  # noqa
+        1 / 0
+    except Exception:
+        capture_exception()
+
+    event, = events
+
+    assert event["exception"]["values"][0]["stacktrace"]["frames"][0]["vars"]["a"] == {
+        "hi": "'hi'"
+    }
+
+
+def test_object_sends_exception(sentry_init, capture_events):
+    sentry_init()
+    events = capture_events()
+
+    class C(object):
+        def __repr__(self):
+            try:
+                1 / 0
+            except ZeroDivisionError:
+                capture_exception()
+            return "hi, i am a repr"
+
+    try:
+        a = C()  # noqa
+        1 / 0
+    except Exception:
+        capture_exception()
+
+    event, = events
+
+    assert (
+        event["exception"]["values"][0]["stacktrace"]["frames"][0]["vars"]["a"]
+        == "hi, i am a repr"
     )
 
 
