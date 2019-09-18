@@ -4,9 +4,14 @@ import json
 
 import pytest
 
+import gevent
+import eventlet
+
 import sentry_sdk
 from sentry_sdk._compat import reraise, string_types, iteritems
 from sentry_sdk.transport import Transport
+
+from tests import _warning_recorder, _warning_recorder_mgr
 
 SEMAPHORE = "./semaphore"
 
@@ -48,8 +53,64 @@ def internal_exceptions(request, monkeypatch):
     return errors
 
 
+@pytest.fixture(autouse=True, scope="session")
+def _capture_internal_warnings():
+    yield
+
+    _warning_recorder_mgr.__exit__(None, None, None)
+    recorder = _warning_recorder
+
+    for warning in recorder:
+        try:
+            if isinstance(warning.message, ResourceWarning):
+                continue
+        except NameError:
+            pass
+
+        # pytest-django
+        if "getfuncargvalue" in str(warning.message):
+            continue
+
+        # Happens when re-initializing the SDK
+        if "but it was only enabled on init()" in str(warning.message):
+            continue
+
+        # sanic's usage of aiohttp for test client
+        if "verify_ssl is deprecated, use ssl=False instead" in str(warning.message):
+            continue
+
+        if "getargspec" in str(warning.message) and warning.filename.endswith(
+            ("pyramid/config/util.py", "pyramid/config/views.py")
+        ):
+            continue
+
+        if "isAlive() is deprecated" in str(
+            warning.message
+        ) and warning.filename.endswith("celery/utils/timer2.py"):
+            continue
+
+        if "collections.abc" in str(warning.message) and warning.filename.endswith(
+            ("celery/canvas.py", "werkzeug/datastructures.py", "tornado/httputil.py")
+        ):
+            continue
+
+        # Django 1.7 emits a (seemingly) false-positive warning for our test
+        # app and suggests to use a middleware that does not exist in later
+        # Django versions.
+        if "SessionAuthenticationMiddleware" in str(warning.message):
+            continue
+
+        if "Something has already installed a non-asyncio" in str(warning.message):
+            continue
+
+        if "dns.hash" in str(warning.message) or "dns/namedict" in warning.filename:
+            continue
+
+        raise AssertionError(warning)
+
+
 @pytest.fixture
-def monkeypatch_test_transport(monkeypatch, assert_semaphore_acceptance):
+def monkeypatch_test_transport(monkeypatch, semaphore_normalize):
     def check_event(event):
         def check_string_keys(map):
             for key, value in iteritems(map):
@@ -58,7 +119,7 @@ def monkeypatch_test_transport(monkeypatch, assert_semaphore_acceptance):
                     check_string_keys(value)
 
         check_string_keys(event)
-        assert_semaphore_acceptance(event)
+        semaphore_normalize(event)
 
     def inner(client):
         monkeypatch.setattr(client, "transport", TestTransport(check_event))
@@ -87,20 +148,24 @@ def _no_errors_in_semaphore_response(obj):
 
 
 @pytest.fixture
-def assert_semaphore_acceptance(tmpdir):
+def semaphore_normalize(tmpdir):
     def inner(event):
         if not SEMAPHORE:
             return
-        # not dealing with the subprocess API right now
-        file = tmpdir.join("event")
-        file.write(json.dumps(dict(event)))
-        output = json.loads(
-            subprocess.check_output(
-                [SEMAPHORE, "process-event"], stdin=file.open()
-            ).decode("utf-8")
-        )
-        _no_errors_in_semaphore_response(output)
-        output.pop("_meta", None)
+
+        # Disable subprocess integration
+        with sentry_sdk.Hub(None):
+            # not dealing with the subprocess API right now
+            file = tmpdir.join("event")
+            file.write(json.dumps(dict(event)))
+            output = json.loads(
+                subprocess.check_output(
+                    [SEMAPHORE, "process-event"], stdin=file.open()
+                ).decode("utf-8")
+            )
+            _no_errors_in_semaphore_response(output)
+            output.pop("_meta", None)
+            return output
 
     return inner
 
@@ -176,3 +241,29 @@ class EventStreamReader(object):
 
     def read_flush(self):
         assert self.file.readline() == b"flush\n"
+
+
+# scope=session ensures that fixture is run earlier
+@pytest.fixture(scope="session", params=[None, "eventlet", "gevent"])
+def maybe_monkeypatched_threading(request):
+    if request.param == "eventlet":
+        try:
+            eventlet.monkey_patch()
+        except AttributeError as e:
+            if "'thread.RLock' object has no attribute" in str(e):
+                # https://bitbucket.org/pypy/pypy/issues/2962/gevent-cannot-patch-rlock-under-pypy-27-7
+                pytest.skip("https://github.com/eventlet/eventlet/issues/546")
+            else:
+                raise
+    elif request.param == "gevent":
+        try:
+            gevent.monkey.patch_all()
+        except Exception as e:
+            if "_RLock__owner" in str(e):
+                pytest.skip("https://github.com/gevent/gevent/issues/1380")
+            else:
+                raise
+    else:
+        assert request.param is None
+
+    return request.param

@@ -6,9 +6,10 @@ import logging
 from contextlib import contextmanager
 from datetime import datetime
 
-from sentry_sdk._compat import urlparse, text_type, implements_str, int_types, PY2
+from sentry_sdk._compat import urlparse, text_type, implements_str, PY2
 
-MYPY = False
+from sentry_sdk._types import MYPY
+
 if MYPY:
     from typing import Any
     from typing import Callable
@@ -18,24 +19,13 @@ if MYPY:
     from typing import Optional
     from typing import Set
     from typing import Tuple
-    from typing import Type
     from typing import Union
+    from types import FrameType
+    from types import TracebackType
 
-    from sentry_sdk.hub import Hub
+    import sentry_sdk
 
-    ExcInfo = Tuple[
-        Optional[Type[BaseException]], Optional[BaseException], Optional[Any]
-    ]
-
-    Event = Dict[str, Any]
-    Hint = Dict[str, Any]
-
-    Breadcrumb = Dict[str, Any]
-    BreadcrumbHint = Dict[str, Any]
-
-    EventProcessor = Callable[[Event, Hint], Optional[Event]]
-    ErrorProcessor = Callable[[Event, ExcInfo], Optional[Event]]
-    BreadcrumbProcessor = Callable[[Breadcrumb, BreadcrumbHint], Optional[Breadcrumb]]
+    from sentry_sdk._types import ExcInfo
 
 epoch = datetime(1970, 1, 1)
 
@@ -48,7 +38,7 @@ MAX_FORMAT_PARAM_LENGTH = 128
 
 
 def _get_debug_hub():
-    # type: () -> Optional[Hub]
+    # type: () -> Optional[sentry_sdk.Hub]
     # This function is replaced by debug.py
     pass
 
@@ -205,13 +195,20 @@ class AnnotatedValue(object):
         self.metadata = metadata
 
 
+if MYPY:
+    from typing import TypeVar
+
+    T = TypeVar("T")
+    Annotated = Union[AnnotatedValue, T]
+
+
 def get_type_name(cls):
-    # type: (Any) -> str
+    # type: (Optional[type]) -> Optional[str]
     return getattr(cls, "__qualname__", None) or getattr(cls, "__name__", None)
 
 
 def get_type_module(cls):
-    # type: (Any) -> Optional[Any]
+    # type: (Optional[type]) -> Optional[str]
     mod = getattr(cls, "__module__", None)
     if mod not in (None, "builtins", "__builtins__"):
         return mod
@@ -219,7 +216,7 @@ def get_type_module(cls):
 
 
 def should_hide_frame(frame):
-    # type: (Any) -> bool
+    # type: (FrameType) -> bool
     try:
         mod = frame.f_globals["__name__"]
         if mod.startswith("sentry_sdk."):
@@ -238,20 +235,12 @@ def should_hide_frame(frame):
 
 
 def iter_stacks(tb):
-    # type: (Any) -> Iterator[Any]
-    while tb is not None:
-        if not should_hide_frame(tb.tb_frame):
-            yield tb
-        tb = tb.tb_next
-
-
-def slim_string(value, length=MAX_STRING_LENGTH):
-    # type: (str, int) -> str
-    if not value:
-        return value
-    if len(value) > length:
-        return value[: length - 3] + "..."
-    return value[:length]
+    # type: (Optional[TracebackType]) -> Iterator[TracebackType]
+    tb_ = tb  # type: Optional[TracebackType]
+    while tb_ is not None:
+        if not should_hide_frame(tb_.tb_frame):
+            yield tb_
+        tb_ = tb_.tb_next
 
 
 def get_lines_from_file(
@@ -260,12 +249,12 @@ def get_lines_from_file(
     loader=None,  # type: Optional[Any]
     module=None,  # type: Optional[str]
 ):
-    # type: (...) -> Tuple[List[str], Optional[str], List[str]]
+    # type: (...) -> Tuple[List[Annotated[str]], Optional[Annotated[str]], List[Annotated[str]]]
     context_lines = 5
     source = None
     if loader is not None and hasattr(loader, "get_source"):
         try:
-            source_str = loader.get_source(module)
+            source_str = loader.get_source(module)  # type: Optional[str]
         except (ImportError, IOError):
             source_str = None
         if source_str is not None:
@@ -285,11 +274,11 @@ def get_lines_from_file(
 
     try:
         pre_context = [
-            slim_string(line.strip("\r\n")) for line in source[lower_bound:lineno]
+            strip_string(line.strip("\r\n")) for line in source[lower_bound:lineno]
         ]
-        context_line = slim_string(source[lineno].strip("\r\n"))
+        context_line = strip_string(source[lineno].strip("\r\n"))
         post_context = [
-            slim_string(line.strip("\r\n"))
+            strip_string(line.strip("\r\n"))
             for line in source[(lineno + 1) : upper_bound]
         ]
         return pre_context, context_line, post_context
@@ -298,10 +287,13 @@ def get_lines_from_file(
         return [], None, []
 
 
-def get_source_context(frame, tb_lineno):
-    # type: (Any, int) -> Tuple[List[str], Optional[str], List[str]]
+def get_source_context(
+    frame,  # type: FrameType
+    tb_lineno,  # type: int
+):
+    # type: (...) -> Tuple[List[Annotated[str]], Optional[Annotated[str]], List[Annotated[str]]]
     try:
-        abs_path = frame.f_code.co_filename
+        abs_path = frame.f_code.co_filename  # type: Optional[str]
     except Exception:
         abs_path = None
     try:
@@ -355,7 +347,10 @@ def safe_repr(value):
 
 
 def filename_for_module(module, abs_path):
-    # type: (str, str) -> str
+    # type: (Optional[str], Optional[str]) -> Optional[str]
+    if not abs_path or not module:
+        return abs_path
+
     try:
         if abs_path.endswith(".pyc"):
             abs_path = abs_path[:-1]
@@ -373,14 +368,14 @@ def filename_for_module(module, abs_path):
 
 
 def serialize_frame(frame, tb_lineno=None, with_locals=True):
-    # type: (Any, Optional[int], bool) -> Dict[str, Any]
+    # type: (FrameType, Optional[int], bool) -> Dict[str, Any]
     f_code = getattr(frame, "f_code", None)
-    if f_code:
-        abs_path = frame.f_code.co_filename
-        function = frame.f_code.co_name
-    else:
+    if not f_code:
         abs_path = None
         function = None
+    else:
+        abs_path = frame.f_code.co_filename
+        function = frame.f_code.co_name
     try:
         module = frame.f_globals["__name__"]
     except Exception:
@@ -400,14 +395,14 @@ def serialize_frame(frame, tb_lineno=None, with_locals=True):
         "pre_context": pre_context,
         "context_line": context_line,
         "post_context": post_context,
-    }
+    }  # type: Dict[str, Any]
     if with_locals:
         rv["vars"] = frame.f_locals
     return rv
 
 
 def stacktrace_from_traceback(tb=None, with_locals=True):
-    # type: (Any, bool) -> Dict[str, List[Dict[str, Any]]]
+    # type: (Optional[TracebackType], bool) -> Dict[str, List[Dict[str, Any]]]
     return {
         "frames": [
             serialize_frame(
@@ -442,7 +437,7 @@ def get_errno(exc_value):
 def single_exception_from_error_tuple(
     exc_type,  # type: Optional[type]
     exc_value,  # type: Optional[BaseException]
-    tb,  # type: Optional[Any]
+    tb,  # type: Optional[TracebackType]
     client_options=None,  # type: Optional[dict]
     mechanism=None,  # type: Optional[Dict[str, Any]]
 ):
@@ -658,12 +653,18 @@ def _module_in_set(name, set):
     return False
 
 
-def strip_string(value, max_length=512):
-    # type: (str, int) -> Union[AnnotatedValue, str]
+def strip_string(value, max_length=None):
+    # type: (str, Optional[int]) -> Union[AnnotatedValue, str]
     # TODO: read max_length from config
     if not value:
         return value
+
+    if max_length is None:
+        # This is intentionally not just the default such that one can patch `MAX_STRING_LENGTH` and affect `strip_string`.
+        max_length = MAX_STRING_LENGTH
+
     length = len(value)
+
     if length > max_length:
         return AnnotatedValue(
             value=value[: max_length - 3] + u"...",
@@ -675,71 +676,12 @@ def strip_string(value, max_length=512):
     return value
 
 
-def format_and_strip(
-    template, params, strip_string=strip_string, max_length=MAX_FORMAT_PARAM_LENGTH
-):
-    """Format a string containing %s for placeholders and call `strip_string`
-    on each parameter. The string template itself does not have a maximum
-    length.
-
-    TODO: handle other placeholders, not just %s
-    """
-    chunks = template.split(u"%s")
-    if not chunks:
-        raise ValueError("No formatting placeholders found")
-
-    params = list(reversed(params))
-    rv_remarks = []  # type: List[Any]
-    rv_original_length = 0
-    rv_length = 0
-    rv = []  # type: List[str]
-
-    def realign_remark(remark):
-        return [
-            (rv_length + x if isinstance(x, int_types) and i < 4 else x)
-            for i, x in enumerate(remark)
-        ]
-
-    for chunk in chunks[:-1]:
-        rv.append(chunk)
-        rv_length += len(chunk)
-        rv_original_length += len(chunk)
-        if not params:
-            raise ValueError("Not enough params.")
-        param = params.pop()
-
-        stripped_param = strip_string(param, max_length=max_length)
-        if isinstance(stripped_param, AnnotatedValue):
-            rv_remarks.extend(
-                realign_remark(remark) for remark in stripped_param.metadata["rem"]
-            )
-            stripped_param = stripped_param.value
-
-        rv_original_length += len(param)
-        rv_length += len(stripped_param)
-        rv.append(stripped_param)
-
-    rv.append(chunks[-1])
-    rv_length += len(chunks[-1])
-    rv_original_length += len(chunks[-1])
-
-    rv_joined = u"".join(rv)
-    assert len(rv_joined) == rv_length
-
-    if not rv_remarks:
-        return rv_joined
-
-    return AnnotatedValue(
-        value=rv_joined, metadata={"len": rv_original_length, "rem": rv_remarks}
-    )
-
-
 def _is_threading_local_monkey_patched():
     # type: () -> bool
     try:
         from gevent.monkey import is_object_patched  # type: ignore
 
-        if is_object_patched("_threading", "local"):
+        if is_object_patched("threading", "local"):
             return True
     except ImportError:
         pass
@@ -755,10 +697,6 @@ def _is_threading_local_monkey_patched():
     return False
 
 
-IS_THREADING_LOCAL_MONKEY_PATCHED = _is_threading_local_monkey_patched()
-del _is_threading_local_monkey_patched
-
-
 def _get_contextvars():
     # () -> (bool, Type)
     """
@@ -768,7 +706,7 @@ def _get_contextvars():
 
     https://github.com/gevent/gevent/issues/1407
     """
-    if not IS_THREADING_LOCAL_MONKEY_PATCHED:
+    if not _is_threading_local_monkey_patched():
         try:
             from contextvars import ContextVar  # type: ignore
 
@@ -798,7 +736,6 @@ def _get_contextvars():
 
 
 HAS_REAL_CONTEXTVARS, ContextVar = _get_contextvars()
-del _get_contextvars
 
 
 def transaction_from_function(func):

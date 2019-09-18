@@ -35,6 +35,11 @@ urlpatterns = [
     path("classbased", views.ClassBasedView.as_view(), name="classbased"),
     path("post-echo", views.post_echo, name="post_echo"),
     path("template-exc", views.template_exc, name="template_exc"),
+    path(
+        "permission-denied-exc",
+        views.permission_denied_exc,
+        name="permission_denied_exc",
+    ),
 ]
 
 
@@ -47,6 +52,14 @@ try:
             "rest-framework-read-body-and-exc",
             views.rest_framework_read_body_and_exc,
             name="rest_framework_read_body_and_exc",
+        )
+    )
+    urlpatterns.append(path("rest-hello", views.rest_hello, name="rest_hello"))
+    urlpatterns.append(
+        path(
+            "rest-permission-denied-exc",
+            views.rest_permission_denied_exc,
+            name="rest_permission_denied_exc",
         )
     )
 except AttributeError:

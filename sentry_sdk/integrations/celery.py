@@ -1,5 +1,6 @@
 from __future__ import absolute_import
 
+import functools
 import sys
 
 from celery.exceptions import (  # type: ignore
@@ -11,10 +12,14 @@ from celery.exceptions import (  # type: ignore
 
 from sentry_sdk.hub import Hub
 from sentry_sdk.utils import capture_internal_exceptions, event_from_exception
-from sentry_sdk.tracing import SpanContext
+from sentry_sdk.tracing import Span
 from sentry_sdk._compat import reraise
 from sentry_sdk.integrations import Integration
 from sentry_sdk.integrations.logging import ignore_logger
+from sentry_sdk._types import MYPY
+
+if MYPY:
+    from typing import Any
 
 
 CELERY_CONTROL_FLOW_EXCEPTIONS = (Retry, Ignore, Reject)
@@ -24,6 +29,7 @@ class CeleryIntegration(Integration):
     identifier = "celery"
 
     def __init__(self, propagate_traces=True):
+        # type: (bool) -> None
         self.propagate_traces = propagate_traces
 
     @staticmethod
@@ -56,9 +62,11 @@ class CeleryIntegration(Integration):
         # Meaning that every task's breadcrumbs are full of stuff like "Task
         # <foo> raised unexpected <bar>".
         ignore_logger("celery.worker.job")
+        ignore_logger("celery.app.trace")
 
 
 def _wrap_apply_async(task, f):
+    @functools.wraps(f)
     def apply_async(*args, **kwargs):
         hub = Hub.current
         integration = hub.get_integration(CeleryIntegration)
@@ -70,7 +78,11 @@ def _wrap_apply_async(task, f):
                 headers[key] = value
             if headers is not None:
                 kwargs["headers"] = headers
-        return f(*args, **kwargs)
+
+            with hub.start_span(op="celery.submit", description=task.name):
+                return f(*args, **kwargs)
+        else:
+            return f(*args, **kwargs)
 
     return apply_async
 
@@ -82,6 +94,7 @@ def _wrap_tracer(task, f):
     # This is the reason we don't use signals for hooking in the first place.
     # Also because in Celery 3, signal dispatch returns early if one handler
     # crashes.
+    @functools.wraps(f)
     def _inner(*args, **kwargs):
         hub = Hub.current
         if hub.get_integration(CeleryIntegration) is None:
@@ -90,25 +103,31 @@ def _wrap_tracer(task, f):
         with hub.push_scope() as scope:
             scope._name = "celery"
             scope.clear_breadcrumbs()
-            _continue_trace(args[3].get("headers") or {}, scope)
             scope.add_event_processor(_make_event_processor(task, *args, **kwargs))
 
-            return f(*args, **kwargs)
+            span = Span.continue_from_headers(args[3].get("headers") or {})
+            span.op = "celery.task"
+            span.transaction = "unknown celery task"
+
+            with capture_internal_exceptions():
+                # Celery task objects are not a thing to be trusted. Even
+                # something such as attribute access can fail.
+                span.transaction = task.name
+
+            with hub.start_span(span):
+                return f(*args, **kwargs)
 
     return _inner
-
-
-def _continue_trace(headers, scope):
-    if headers:
-        span_context = SpanContext.continue_from_headers(headers)
-    else:
-        span_context = SpanContext.start_trace()
-    scope.set_span_context(span_context)
 
 
 def _wrap_task_call(task, f):
     # Need to wrap task call because the exception is caught before we get to
     # see it. Also celery's reported stacktrace is untrustworthy.
+
+    # functools.wraps is important here because celery-once looks at this
+    # method's name.
+    # https://github.com/getsentry/sentry-python/issues/421
+    @functools.wraps(f)
     def _inner(*args, **kwargs):
         try:
             return f(*args, **kwargs)
@@ -123,9 +142,6 @@ def _wrap_task_call(task, f):
 
 def _make_event_processor(task, uuid, args, kwargs, request=None):
     def event_processor(event, hint):
-        with capture_internal_exceptions():
-            event["transaction"] = task.name
-
         with capture_internal_exceptions():
             extra = event.setdefault("extra", {})
             extra["celery-job"] = {
@@ -158,13 +174,20 @@ def _capture_exception(task, exc_info):
     if hasattr(task, "throws") and isinstance(exc_info[1], task.throws):
         return
 
+    # If an integration is there, a client has to be there.
+    client = hub.client  # type: Any
+
     event, hint = event_from_exception(
         exc_info,
-        client_options=hub.client.options,
+        client_options=client.options,
         mechanism={"type": "celery", "handled": False},
     )
 
     hub.capture_event(event, hint=hint)
+
+    with capture_internal_exceptions():
+        with hub.configure_scope() as scope:
+            scope.span.set_failure()
 
 
 def _patch_worker_exit():

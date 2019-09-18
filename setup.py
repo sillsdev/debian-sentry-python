@@ -12,7 +12,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="sentry-sdk",
-    version="0.9.5",
+    version="0.12.0",
     author="Sentry Team and Contributors",
     author_email="hello@getsentry.com",
     url="https://github.com/getsentry/sentry-python",
@@ -23,7 +23,7 @@ setup(
     package_data={"sentry_sdk": ["py.typed"]},
     zip_safe=False,
     license="BSD",
-    install_requires=["urllib3", "certifi"],
+    install_requires=["urllib3>=1.9", "certifi"],
     extras_require={
         "flask": ["flask>=0.8", "blinker>=1.1"],
         "bottle": ["bottle>=0.12.13"],
