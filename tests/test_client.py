@@ -1,4 +1,5 @@
 # coding: utf-8
+import os
 import json
 import pytest
 import subprocess
@@ -7,7 +8,6 @@ import time
 
 from textwrap import dedent
 from sentry_sdk import Hub, Client, configure_scope, capture_message, capture_exception
-from sentry_sdk.hub import HubMeta
 from sentry_sdk.transport import Transport
 from sentry_sdk._compat import reraise, text_type, PY2
 from sentry_sdk.utils import HAS_CHAINED_EXCEPTIONS
@@ -32,6 +32,9 @@ class _TestTransport(Transport):
 
 
 def test_transport_option(monkeypatch):
+    if "SENTRY_DSN" in os.environ:
+        monkeypatch.delenv("SENTRY_DSN")
+
     dsn = "https://foo@sentry.io/123"
     dsn2 = "https://bar@sentry.io/124"
     assert str(Client(dsn=dsn).dsn) == dsn
@@ -325,29 +328,6 @@ def test_configure_scope_available(sentry_init, request, monkeypatch):
     assert configure_scope(callback) is None
     assert len(calls) == 1
     assert calls[0] is Hub.current._stack[-1][1]
-
-
-@pytest.mark.parametrize("no_sdk", (True, False))
-def test_configure_scope_unavailable(no_sdk, monkeypatch):
-    if no_sdk:
-        # Emulate minimal without SDK installation: callbacks are not called
-        monkeypatch.setattr(HubMeta, "current", None)
-        assert not Hub.current
-    else:
-        # Still, no client configured
-        assert Hub.current
-
-    calls = []
-
-    def callback(scope):
-        calls.append(scope)
-        scope.set_tag("foo", "bar")
-
-    with configure_scope() as scope:
-        scope.set_tag("foo", "bar")
-
-    assert configure_scope(callback) is None
-    assert not calls
 
 
 @pytest.mark.tests_internal_exceptions
