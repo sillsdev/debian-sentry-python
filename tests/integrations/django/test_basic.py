@@ -1,3 +1,5 @@
+from __future__ import absolute_import
+
 import pytest
 import json
 
@@ -81,6 +83,7 @@ def test_transaction_with_class_view(sentry_init, client, capture_events):
     assert event["message"] == "hi"
 
 
+@pytest.mark.forked
 @pytest.mark.django_db
 def test_user_captured(sentry_init, client, capture_events):
     sentry_init(integrations=[DjangoIntegration()], send_default_pii=True)
@@ -102,6 +105,7 @@ def test_user_captured(sentry_init, client, capture_events):
     }
 
 
+@pytest.mark.forked
 @pytest.mark.django_db
 def test_queryset_repr(sentry_init, capture_events):
     sentry_init(integrations=[DjangoIntegration()])
@@ -156,6 +160,7 @@ def test_500(sentry_init, client, capture_events):
     assert content == "Sentry error: %s" % event_id
 
 
+@pytest.mark.forked
 def test_management_command_raises():
     # This just checks for our assumption that Django passes through all
     # exceptions by default, so our excepthook can be used for management
@@ -164,6 +169,7 @@ def test_management_command_raises():
         execute_from_command_line(["manage.py", "mycrash"])
 
 
+@pytest.mark.forked
 @pytest.mark.django_db
 @pytest.mark.parametrize("with_integration", [True, False])
 def test_sql_queries(sentry_init, capture_events, with_integration):
@@ -175,9 +181,16 @@ def test_sql_queries(sentry_init, capture_events, with_integration):
 
     from django.db import connection
 
-    sql = connection.cursor()
+    sentry_init(
+        integrations=[DjangoIntegration()],
+        send_default_pii=True,
+        _experiments={"record_sql_params": True},
+    )
 
     events = capture_events()
+
+    sql = connection.cursor()
+
     with pytest.raises(OperationalError):
         # table doesn't even exist
         sql.execute("""SELECT count(*) FROM people_person WHERE foo = %s""", [123])
@@ -193,6 +206,7 @@ def test_sql_queries(sentry_init, capture_events, with_integration):
         assert crumb["data"]["db.params"] == [123]
 
 
+@pytest.mark.forked
 @pytest.mark.django_db
 def test_sql_dict_query_params(sentry_init, capture_events):
     sentry_init(
@@ -234,6 +248,7 @@ def test_sql_dict_query_params(sentry_init, capture_events):
         lambda sql: sql.SQL('SELECT %(my_param)s FROM "foobar"'),
     ],
 )
+@pytest.mark.forked
 @pytest.mark.django_db
 def test_sql_psycopg2_string_composition(sentry_init, capture_events, query):
     sentry_init(
@@ -262,6 +277,7 @@ def test_sql_psycopg2_string_composition(sentry_init, capture_events, query):
     assert crumb["data"]["db.params"] == {"my_param": 10}
 
 
+@pytest.mark.forked
 @pytest.mark.django_db
 def test_sql_psycopg2_placeholders(sentry_init, capture_events):
     sentry_init(
@@ -432,58 +448,28 @@ def test_template_exception(sentry_init, client, capture_events):
     "route", ["rest_framework_exc", "rest_framework_read_body_and_exc"]
 )
 @pytest.mark.parametrize(
-    "type,event_request",
+    "ct,body",
     [
-        [
-            "json",
-            lambda route: {
-                "cookies": {},
-                "data": {"foo": "bar"},
-                "env": {"SERVER_NAME": "localhost", "SERVER_PORT": "80"},
-                "headers": {
-                    "Content-Length": "14",
-                    "Content-Type": "application/json",
-                    "Host": "localhost",
-                },
-                "method": "POST",
-                "query_string": "",
-                "url": "http://localhost/{}".format(route.replace("_", "-")),
-            },
-        ],
-        [
-            "formdata",
-            lambda route: {
-                "cookies": {},
-                "data": {"foo": "bar"},
-                "env": {"SERVER_NAME": "localhost", "SERVER_PORT": "80"},
-                "headers": {
-                    "Content-Length": "7",
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "Host": "localhost",
-                },
-                "method": "POST",
-                "query_string": "",
-                "url": "http://localhost/{}".format(route.replace("_", "-")),
-            },
-        ],
+        ["application/json", {"foo": "bar"}],
+        ["application/json", 1],
+        ["application/json", "foo"],
+        ["application/x-www-form-urlencoded", {"foo": "bar"}],
     ],
 )
 def test_rest_framework_basic(
-    sentry_init, client, capture_events, capture_exceptions, type, event_request, route
+    sentry_init, client, capture_events, capture_exceptions, ct, body, route
 ):
     pytest.importorskip("rest_framework")
     sentry_init(integrations=[DjangoIntegration()], send_default_pii=True)
     exceptions = capture_exceptions()
     events = capture_events()
 
-    if type == "json":
+    if ct == "application/json":
         client.post(
-            reverse(route),
-            data=json.dumps({"foo": "bar"}),
-            content_type="application/json",
+            reverse(route), data=json.dumps(body), content_type="application/json"
         )
-    elif type == "formdata":
-        client.post(reverse(route), data={"foo": "bar"})
+    elif ct == "application/x-www-form-urlencoded":
+        client.post(reverse(route), data=body)
     else:
         assert False
 
@@ -493,7 +479,8 @@ def test_rest_framework_basic(
     event, = events
     assert event["exception"]["values"][0]["mechanism"]["type"] == "django"
 
-    assert event["request"] == event_request(route)
+    assert event["request"]["data"] == body
+    assert event["request"]["headers"]["Content-Type"] == ct
 
 
 @pytest.mark.parametrize(
@@ -531,6 +518,7 @@ def test_middleware_spans(sentry_init, client, capture_events):
 
     if DJANGO_VERSION >= (1, 10):
         reference_value = [
+            "tests.integrations.django.myapp.settings.TestFunctionMiddleware.__call__",
             "tests.integrations.django.myapp.settings.TestMiddleware.__call__",
             "django.contrib.auth.middleware.AuthenticationMiddleware.__call__",
             "django.contrib.sessions.middleware.SessionMiddleware.__call__",

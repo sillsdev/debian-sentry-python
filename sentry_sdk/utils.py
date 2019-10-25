@@ -3,27 +3,27 @@ import sys
 import linecache
 import logging
 
-from contextlib import contextmanager
 from datetime import datetime
 
+import sentry_sdk
 from sentry_sdk._compat import urlparse, text_type, implements_str, PY2
 
 from sentry_sdk._types import MYPY
 
 if MYPY:
+    from types import FrameType
+    from types import TracebackType
     from typing import Any
     from typing import Callable
     from typing import Dict
+    from typing import ContextManager
     from typing import Iterator
     from typing import List
     from typing import Optional
     from typing import Set
     from typing import Tuple
     from typing import Union
-    from types import FrameType
-    from types import TracebackType
-
-    import sentry_sdk
+    from typing import Type
 
     from sentry_sdk._types import ExcInfo
 
@@ -43,15 +43,34 @@ def _get_debug_hub():
     pass
 
 
-@contextmanager
+class CaptureInternalException(object):
+    __slots__ = ()
+
+    def __enter__(self):
+        # type: () -> ContextManager[Any]
+        return self
+
+    def __exit__(self, ty, value, tb):
+        # type: (Optional[Type[BaseException]], Optional[BaseException], Optional[TracebackType]) -> bool
+        if ty is not None and value is not None:
+            capture_internal_exception((ty, value, tb))
+
+        return True
+
+
+_CAPTURE_INTERNAL_EXCEPTION = CaptureInternalException()
+
+
 def capture_internal_exceptions():
-    # type: () -> Iterator
-    try:
-        yield
-    except Exception:
-        hub = _get_debug_hub()
-        if hub is not None:
-            hub._capture_internal_exception(sys.exc_info())
+    # type: () -> ContextManager[Any]
+    return _CAPTURE_INTERNAL_EXCEPTION
+
+
+def capture_internal_exception(exc_info):
+    # type: (ExcInfo) -> None
+    hub = _get_debug_hub()
+    if hub is not None:
+        hub._capture_internal_exception(exc_info)
 
 
 def to_timestamp(value):
@@ -85,16 +104,25 @@ class Dsn(object):
             self.__dict__ = dict(value.__dict__)
             return
         parts = urlparse.urlsplit(text_type(value))
+
         if parts.scheme not in (u"http", u"https"):
             raise BadDsn("Unsupported scheme %r" % parts.scheme)
         self.scheme = parts.scheme
+
+        if parts.hostname is None:
+            raise BadDsn("Missing hostname")
+
         self.host = parts.hostname
-        self.port = parts.port
-        if self.port is None:
+
+        if parts.port is None:
             self.port = self.scheme == "https" and 443 or 80
-        self.public_key = parts.username
-        if not self.public_key:
+        else:
+            self.port = parts.port
+
+        if not parts.username:
             raise BadDsn("Missing public key")
+
+        self.public_key = parts.username
         self.secret_key = parts.password
 
         path = parts.path.rsplit("/", 1)
@@ -189,6 +217,8 @@ class Auth(object):
 
 
 class AnnotatedValue(object):
+    __slots__ = ("value", "metadata")
+
     def __init__(self, value, metadata):
         # type: (Optional[Any], Dict[str, Any]) -> None
         self.value = value
@@ -398,6 +428,7 @@ def serialize_frame(frame, tb_lineno=None, with_locals=True):
     }  # type: Dict[str, Any]
     if with_locals:
         rv["vars"] = frame.f_locals
+
     return rv
 
 
@@ -438,7 +469,7 @@ def single_exception_from_error_tuple(
     exc_type,  # type: Optional[type]
     exc_value,  # type: Optional[BaseException]
     tb,  # type: Optional[TracebackType]
-    client_options=None,  # type: Optional[dict]
+    client_options=None,  # type: Optional[Dict[str, Any]]
     mechanism=None,  # type: Optional[Dict[str, Any]]
 ):
     # type: (...) -> Dict[str, Any]
@@ -511,7 +542,7 @@ else:
 
 def exceptions_from_error_tuple(
     exc_info,  # type: ExcInfo
-    client_options=None,  # type: Optional[dict]
+    client_options=None,  # type: Optional[Dict[str, Any]]
     mechanism=None,  # type: Optional[Dict[str, Any]]
 ):
     # type: (...) -> List[Dict[str, Any]]
@@ -559,7 +590,7 @@ def iter_event_frames(event):
 
 
 def handle_in_app(event, in_app_exclude=None, in_app_include=None):
-    # type: (Dict[str, Any], Optional[List], Optional[List]) -> Dict[str, Any]
+    # type: (Dict[str, Any], Optional[List[str]], Optional[List[str]]) -> Dict[str, Any]
     for stacktrace in iter_event_stacktraces(event):
         handle_in_app_impl(
             stacktrace.get("frames"),
@@ -571,7 +602,7 @@ def handle_in_app(event, in_app_exclude=None, in_app_include=None):
 
 
 def handle_in_app_impl(frames, in_app_exclude, in_app_include):
-    # type: (Any, Optional[List], Optional[List]) -> Optional[Any]
+    # type: (Any, Optional[List[str]], Optional[List[str]]) -> Optional[Any]
     if not frames:
         return None
 
@@ -624,7 +655,7 @@ def exc_info_from_error(error):
 
 def event_from_exception(
     exc_info,  # type: Union[BaseException, ExcInfo]
-    client_options=None,  # type: Optional[dict]
+    client_options=None,  # type: Optional[Dict[str, Any]]
     mechanism=None,  # type: Optional[Dict[str, Any]]
 ):
     # type: (...) -> Tuple[Dict[str, Any], Dict[str, Any]]
@@ -644,7 +675,7 @@ def event_from_exception(
 
 
 def _module_in_set(name, set):
-    # type: (str, Optional[List]) -> bool
+    # type: (str, Optional[List[str]]) -> bool
     if not set:
         return False
     for item in set or ():
@@ -698,7 +729,7 @@ def _is_threading_local_monkey_patched():
 
 
 def _get_contextvars():
-    # () -> (bool, Type)
+    # type: () -> Tuple[bool, type]
     """
     Try to import contextvars and use it if it's deemed safe. We should not use
     contextvars if gevent or eventlet have patched thread locals, as
@@ -708,10 +739,10 @@ def _get_contextvars():
     """
     if not _is_threading_local_monkey_patched():
         try:
-            from contextvars import ContextVar  # type: ignore
+            from contextvars import ContextVar
 
             if not PY2 and sys.version_info < (3, 7):
-                import aiocontextvars  # type: ignore  # noqa
+                import aiocontextvars  # noqa
 
             return True, ContextVar
         except ImportError:
@@ -719,18 +750,21 @@ def _get_contextvars():
 
     from threading import local
 
-    class ContextVar(object):  # type: ignore
+    class ContextVar(object):
         # Super-limited impl of ContextVar
 
         def __init__(self, name):
+            # type: (str) -> None
             self._name = name
             self._local = local()
 
         def get(self, default):
+            # type: (Any) -> Any
             return getattr(self._local, "value", default)
 
         def set(self, value):
-            setattr(self._local, "value", value)
+            # type: (Any) -> None
+            self._local.value = value
 
     return False, ContextVar
 
@@ -768,3 +802,6 @@ def transaction_from_function(func):
 
     # Possibly a lambda
     return func_qualname
+
+
+disable_capture_event = ContextVar("disable_capture_event")

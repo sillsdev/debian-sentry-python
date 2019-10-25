@@ -27,6 +27,25 @@ sentry-sdk==0.10.1
 
 A major release `N` implies the previous release `N-1` will no longer receive updates. We generally do not backport bugfixes to older versions unless they are security relevant. However, feel free to ask for backports of specific commits on the bugtracker.
 
+## 0.13.1
+
+* Add new global functions for setting scope/context data.
+* Fix a bug that would make Django 1.11+ apps crash when using function-based middleware.
+
+## 0.13.0
+
+* Remove an old deprecation warning (behavior itself already changed since a long time).
+* The AIOHTTP integration now attaches the request body to crash reports. Thanks to Vitali Rebkavets!
+* Add an experimental PySpark integration.
+* First release to be tested under Python 3.8. No code changes were necessary though, so previous releases also might have worked.
+
+## 0.12.3
+
+* Various performance improvements to event sending.
+* Avoid crashes when scope or hub is racy.
+* Revert a change that broke applications using gevent and channels (in the same virtualenv, but different processes).
+* Fix a bug that made the SDK crash on unicode in SQL.
+
 ## 0.12.2
 
 * Fix a crash with ASGI (Django Channels) when the ASGI request type is neither HTTP nor Websockets.

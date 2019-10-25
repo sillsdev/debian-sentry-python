@@ -5,7 +5,8 @@ import contextlib
 from datetime import datetime
 
 import sentry_sdk
-from sentry_sdk.utils import capture_internal_exceptions, logger
+
+from sentry_sdk.utils import capture_internal_exceptions, logger, to_string
 from sentry_sdk._compat import PY2
 from sentry_sdk._types import MYPY
 
@@ -292,7 +293,9 @@ class Span(object):
             # transaction for this span that would be flushed out eventually.
             return None
 
-        if hub.client is None:
+        client = hub.client
+
+        if client is None:
             # We have no client and therefore nowhere to send this transaction
             # event.
             return None
@@ -315,28 +318,37 @@ class Span(object):
                 "timestamp": self.timestamp,
                 "start_timestamp": self.start_timestamp,
                 "spans": [
-                    s.to_json()
+                    s.to_json(client)
                     for s in self._span_recorder.finished_spans
                     if s is not self
                 ],
             }
         )
 
-    def to_json(self):
-        # type: () -> Any
+    def to_json(self, client):
+        # type: (Optional[sentry_sdk.Client]) -> Dict[str, Any]
         rv = {
             "trace_id": self.trace_id,
             "span_id": self.span_id,
             "parent_span_id": self.parent_span_id,
             "same_process_as_parent": self.same_process_as_parent,
-            "transaction": self.transaction,
             "op": self.op,
             "description": self.description,
             "start_timestamp": self.start_timestamp,
             "timestamp": self.timestamp,
-            "tags": self._tags,
-            "data": self._data,
-        }
+        }  # type: Dict[str, Any]
+
+        transaction = self.transaction
+        if transaction:
+            rv["transaction"] = transaction
+
+        tags = self._tags
+        if tags:
+            rv["tags"] = tags
+
+        data = self._data
+        if data:
+            rv["data"] = data
 
         return rv
 
@@ -373,7 +385,7 @@ def _format_sql(cursor, sql):
     except Exception:
         real_sql = None
 
-    return real_sql or str(sql)
+    return real_sql or to_string(sql)
 
 
 @contextlib.contextmanager
@@ -420,7 +432,7 @@ def record_http_request(hub, url, method):
     # type: (sentry_sdk.Hub, str, str) -> Generator[Dict[str, str], None, None]
     data_dict = {"url": url, "method": method}
 
-    with hub.start_span(op="http", description="%s %s" % (url, method)) as span:
+    with hub.start_span(op="http", description="%s %s" % (method, url)) as span:
         try:
             yield data_dict
         finally:
@@ -438,17 +450,11 @@ def _maybe_create_breadcrumbs_from_span(hub, span):
             message=span.description, type="redis", category="redis", data=span._tags
         )
     elif span.op == "http" and span.is_success():
-        hub.add_breadcrumb(
-            type="http",
-            category="httplib",
-            data=span._data,
-            hint={"httplib_response": span._data.pop("httplib_response", None)},
-        )
+        hub.add_breadcrumb(type="http", category="httplib", data=span._data)
     elif span.op == "subprocess":
         hub.add_breadcrumb(
             type="subprocess",
             category="subprocess",
             message=span.description,
             data=span._data,
-            hint={"popen_instance": span._data.pop("popen_instance", None)},
         )

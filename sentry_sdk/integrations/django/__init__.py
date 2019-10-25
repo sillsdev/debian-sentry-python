@@ -5,11 +5,11 @@ import sys
 import threading
 import weakref
 
-from django import VERSION as DJANGO_VERSION  # type: ignore
-from django.core import signals  # type: ignore
+from django import VERSION as DJANGO_VERSION
+from django.core import signals
 
 from sentry_sdk._types import MYPY
-from sentry_sdk.utils import HAS_REAL_CONTEXTVARS
+from sentry_sdk.utils import HAS_REAL_CONTEXTVARS, logger
 
 if MYPY:
     from typing import Any
@@ -17,20 +17,21 @@ if MYPY:
     from typing import Dict
     from typing import Optional
     from typing import Union
+    from typing import List
 
-    from django.core.handlers.wsgi import WSGIRequest  # type: ignore
-    from django.http.response import HttpResponse  # type: ignore
-    from django.http.request import QueryDict  # type: ignore
-    from django.utils.datastructures import MultiValueDict  # type: ignore
+    from django.core.handlers.wsgi import WSGIRequest
+    from django.http.response import HttpResponse
+    from django.http.request import QueryDict
+    from django.utils.datastructures import MultiValueDict
 
     from sentry_sdk.integrations.wsgi import _ScopedResponse
-    from sentry_sdk._types import Event, Hint
+    from sentry_sdk._types import Event, Hint, EventProcessor, NotImplementedType
 
 
 try:
-    from django.urls import resolve  # type: ignore
+    from django.urls import resolve
 except ImportError:
-    from django.core.urlresolvers import resolve  # type: ignore
+    from django.core.urlresolvers import resolve
 
 from sentry_sdk import Hub
 from sentry_sdk.hub import _should_send_default_pii
@@ -98,7 +99,7 @@ class DjangoIntegration(Integration):
         old_app = WSGIHandler.__call__
 
         def sentry_patched_wsgi_handler(self, environ, start_response):
-            # type: (Any, Dict[str, str], Callable) -> _ScopedResponse
+            # type: (Any, Dict[str, str], Callable[..., Any]) -> _ScopedResponse
             if Hub.current.get_integration(DjangoIntegration) is None:
                 return old_app(self, environ, start_response)
 
@@ -110,7 +111,7 @@ class DjangoIntegration(Integration):
 
         # patch get_response, because at that point we have the Django request
         # object
-        from django.core.handlers.base import BaseHandler  # type: ignore
+        from django.core.handlers.base import BaseHandler
 
         old_get_response = BaseHandler.get_response
 
@@ -187,6 +188,7 @@ class DjangoIntegration(Integration):
 
         @add_global_repr_processor
         def _django_queryset_repr(value, hint):
+            # type: (Any, Dict[str, Any]) -> Union[NotImplementedType, str]
             try:
                 # Django 1.6 can fail to import `QuerySet` when Django settings
                 # have not yet been initialized.
@@ -194,7 +196,7 @@ class DjangoIntegration(Integration):
                 # If we fail to import, return `NotImplemented`. It's at least
                 # unlikely that we have a query set in `value` when importing
                 # `QuerySet` fails.
-                from django.db.models.query import QuerySet  # type: ignore
+                from django.db.models.query import QuerySet
             except Exception:
                 return NotImplemented
 
@@ -221,6 +223,7 @@ _DRF_PATCH_LOCK = threading.Lock()
 
 
 def _patch_drf():
+    # type: () -> None
     """
     Patch Django Rest Framework for more/better request data. DRF's request
     type is a wrapper around Django's request type. The attribute we're
@@ -263,6 +266,7 @@ def _patch_drf():
                 old_drf_initial = APIView.initial
 
                 def sentry_patched_drf_initial(self, request, *args, **kwargs):
+                    # type: (APIView, Any, *Any, **Any) -> Any
                     with capture_internal_exceptions():
                         request._request._sentry_drf_request_backref = weakref.ref(
                             request
@@ -274,6 +278,7 @@ def _patch_drf():
 
 
 def _patch_channels():
+    # type: () -> None
     try:
         from channels.http import AsgiHandler  # type: ignore
     except ImportError:
@@ -282,7 +287,10 @@ def _patch_channels():
     if not HAS_REAL_CONTEXTVARS:
         # We better have contextvars or we're going to leak state between
         # requests.
-        raise RuntimeError(
+        #
+        # We cannot hard-raise here because channels may not be used at all in
+        # the current process.
+        logger.warning(
             "We detected that you are using Django channels 2.0. To get proper "
             "instrumentation for ASGI requests, the Sentry SDK requires "
             "Python 3.7+ or the aiocontextvars package from PyPI."
@@ -293,6 +301,7 @@ def _patch_channels():
     old_app = AsgiHandler.__call__
 
     def sentry_patched_asgi_handler(self, receive, send):
+        # type: (AsgiHandler, Any, Any) -> Any
         if Hub.current.get_integration(DjangoIntegration) is None:
             return old_app(receive, send)
 
@@ -306,7 +315,7 @@ def _patch_channels():
 
 
 def _make_event_processor(weak_request, integration):
-    # type: (Callable[[], WSGIRequest], DjangoIntegration) -> Callable
+    # type: (Callable[[], WSGIRequest], DjangoIntegration) -> EventProcessor
     def event_processor(event, hint):
         # type: (Dict[str, Any], Dict[str, Any]) -> Dict[str, Any]
         # if the request is gone we are fine not logging the data from
@@ -374,9 +383,11 @@ class DjangoRequestExtractor(RequestExtractor):
         return self.request.FILES
 
     def size_of_file(self, file):
+        # type: (Any) -> int
         return file.size
 
     def parsed_body(self):
+        # type: () -> Optional[Dict[str, Any]]
         try:
             return self.request.data
         except AttributeError:
@@ -412,9 +423,9 @@ def install_sql_hook():
     # type: () -> None
     """If installed this causes Django's queries to be captured."""
     try:
-        from django.db.backends.utils import CursorWrapper  # type: ignore
+        from django.db.backends.utils import CursorWrapper
     except ImportError:
-        from django.db.backends.util import CursorWrapper  # type: ignore
+        from django.db.backends.util import CursorWrapper
 
     try:
         real_execute = CursorWrapper.execute
@@ -424,6 +435,7 @@ def install_sql_hook():
         return
 
     def execute(self, sql, params=None):
+        # type: (CursorWrapper, Any, Optional[Any]) -> Any
         hub = Hub.current
         if hub.get_integration(DjangoIntegration) is None:
             return real_execute(self, sql, params)
@@ -434,6 +446,7 @@ def install_sql_hook():
             return real_execute(self, sql, params)
 
     def executemany(self, sql, param_list):
+        # type: (CursorWrapper, Any, List[Any]) -> Any
         hub = Hub.current
         if hub.get_integration(DjangoIntegration) is None:
             return real_executemany(self, sql, param_list)
