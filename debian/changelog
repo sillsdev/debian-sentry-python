@@ -1,8 +1,12 @@
-sentry-python (0.12.2-2) UNRELEASED; urgency=medium
+sentry-python (0.13.1-1) unstable; urgency=medium
 
+  [ Ondřej Nový ]
   * Bump Standards-Version to 4.4.1.
 
- -- Ondřej Nový <onovy@debian.org>  Fri, 18 Oct 2019 16:34:52 +0200
+  [ William Grzybowski ]
+  * New upstream version 0.13.1
+
+ -- William Grzybowski <william@grzy.org>  Fri, 25 Oct 2019 14:01:50 -0300
 
 sentry-python (0.12.2-1) unstable; urgency=medium
 
