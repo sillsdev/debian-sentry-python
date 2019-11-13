@@ -1,10 +1,10 @@
-sentry-python (0.13.1-1) unstable; urgency=medium
+sentry-python (0.13.2-1) unstable; urgency=medium
 
   [ Ondřej Nový ]
   * Bump Standards-Version to 4.4.1.
 
   [ William Grzybowski ]
-  * New upstream version 0.13.1
+  * New upstream version
 
  -- William Grzybowski <william@grzy.org>  Fri, 25 Oct 2019 14:01:50 -0300
 
