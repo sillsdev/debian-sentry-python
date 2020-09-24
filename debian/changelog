@@ -1,3 +1,10 @@
+sentry-python (0.13.2-2) UNRELEASED; urgency=medium
+
+  * d/control: Update Vcs-* fields with new Debian Python Team Salsa
+    layout.
+
+ -- Ondřej Nový <onovy@debian.org>  Thu, 24 Sep 2020 08:43:43 +0200
+
 sentry-python (0.13.2-1) unstable; urgency=medium
 
   [ Ondřej Nový ]
