@@ -10,7 +10,7 @@ export PYBUILD_TEST_ARGS=-k '\
 	not test_httplib_misuse and \
 	not test_crumb_capture and \
 	not test_errors and \
-        not test_proxy_bothselect_httpenv and \
+	not test_proxy_bothselect_httpenv and \
 	not test_proxy_httpselect_httpsenv and \
 	not test_proxy_none_noenv and \
 	not test_proxy_http_fallback_http and \
