@@ -1,7 +1,7 @@
 Source: sentry-python
 Section: python
 Priority: optional
-Maintainer: Debian Python Modules Team <team+python-modules@tracker.debian.org>
+Maintainer: Debian Python Team <team+python@tracker.debian.org>
 Uploaders: William Grzybowski <william@grzy.org>
 Build-Depends: debhelper-compat (= 12),
                dh-python,

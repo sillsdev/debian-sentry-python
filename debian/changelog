@@ -8,6 +8,9 @@ sentry-python (0.13.2-1) UNRELEASED; urgency=medium
   [ William Grzybowski ]
   * New upstream version
 
+  [ Stefano Rivera ]
+  * Update Maintainer to Debian Python Team.
+
  -- William Grzybowski <william@grzy.org>  Fri, 25 Oct 2019 14:01:50 -0300
 
 sentry-python (0.12.2-1) unstable; urgency=medium
