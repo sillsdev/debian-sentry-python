@@ -1,4 +1,6 @@
-sentry-python (0.13.2-1) UNRELEASED; urgency=medium
+sentry-python (0.13.2-1) unstable; urgency=medium
+
+  * Team Upload.
 
   [ Ondřej Nový ]
   * d/control: Update Vcs-* fields with new Debian Python Team Salsa
@@ -13,7 +15,7 @@ sentry-python (0.13.2-1) UNRELEASED; urgency=medium
   * Bump Standards-Version to 4.5.1, no changes needed.
   * Declare Rules-Requires-Root: no.
 
- -- William Grzybowski <william@grzy.org>  Fri, 25 Oct 2019 14:01:50 -0300
+ -- Stefano Rivera <stefanor@debian.org>  Thu, 28 Jan 2021 22:33:58 -0700
 
 sentry-python (0.12.2-1) unstable; urgency=medium
 
