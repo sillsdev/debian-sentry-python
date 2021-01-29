@@ -10,6 +10,7 @@ sentry-python (0.13.2-1) UNRELEASED; urgency=medium
 
   [ Stefano Rivera ]
   * Update Maintainer to Debian Python Team.
+  * Patch: Remove failing pytest.py filename check from test_general.
 
  -- William Grzybowski <william@grzy.org>  Fri, 25 Oct 2019 14:01:50 -0300
 
