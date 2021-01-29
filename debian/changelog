@@ -1,7 +1,6 @@
 sentry-python (0.13.2-1) UNRELEASED; urgency=medium
 
   [ Ondřej Nový ]
-  * Bump Standards-Version to 4.4.1.
   * d/control: Update Vcs-* fields with new Debian Python Team Salsa
     layout.
 
@@ -11,6 +10,7 @@ sentry-python (0.13.2-1) UNRELEASED; urgency=medium
   [ Stefano Rivera ]
   * Update Maintainer to Debian Python Team.
   * Patch: Remove failing pytest.py filename check from test_general.
+  * Bump Standards-Version to 4.5.1, no changes needed.
 
  -- William Grzybowski <william@grzy.org>  Fri, 25 Oct 2019 14:01:50 -0300
 
