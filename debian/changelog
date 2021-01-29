@@ -6,7 +6,7 @@ sentry-python (0.13.2-1) UNRELEASED; urgency=medium
     layout.
 
   [ William Grzybowski ]
-  * New upstream version
+  * New upstream version (Closes: #977095)
 
   [ Stefano Rivera ]
   * Update Maintainer to Debian Python Team.
