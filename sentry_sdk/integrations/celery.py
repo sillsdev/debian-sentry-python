@@ -1,22 +1,15 @@
 from __future__ import absolute_import
 
-import functools
 import sys
-
-from celery.exceptions import (  # type: ignore
-    SoftTimeLimitExceeded,
-    Retry,
-    Ignore,
-    Reject,
-)
 
 from sentry_sdk.hub import Hub
 from sentry_sdk.utils import capture_internal_exceptions, event_from_exception
-from sentry_sdk.tracing import Span
+from sentry_sdk.tracing import Transaction
 from sentry_sdk._compat import reraise
-from sentry_sdk.integrations import Integration
+from sentry_sdk.integrations import Integration, DidNotEnable
 from sentry_sdk.integrations.logging import ignore_logger
 from sentry_sdk._types import MYPY
+from sentry_sdk._functools import wraps
 
 if MYPY:
     from typing import Any
@@ -27,6 +20,18 @@ if MYPY:
     from sentry_sdk._types import EventProcessor, Event, Hint, ExcInfo
 
     F = TypeVar("F", bound=Callable[..., Any])
+
+
+try:
+    from celery import VERSION as CELERY_VERSION  # type: ignore
+    from celery.exceptions import (  # type: ignore
+        SoftTimeLimitExceeded,
+        Retry,
+        Ignore,
+        Reject,
+    )
+except ImportError:
+    raise DidNotEnable("Celery not installed")
 
 
 CELERY_CONTROL_FLOW_EXCEPTIONS = (Retry, Ignore, Reject)
@@ -42,6 +47,9 @@ class CeleryIntegration(Integration):
     @staticmethod
     def setup_once():
         # type: () -> None
+        if CELERY_VERSION < (3,):
+            raise DidNotEnable("Celery 3 or newer required.")
+
         import celery.app.trace as trace  # type: ignore
 
         old_build_tracer = trace.build_tracer
@@ -53,7 +61,6 @@ class CeleryIntegration(Integration):
                 # short-circuits to task.run if it thinks it's safe.
                 task.__call__ = _wrap_task_call(task, task.__call__)
                 task.run = _wrap_task_call(task, task.run)
-                task.apply_async = _wrap_apply_async(task, task.apply_async)
 
                 # `build_tracer` is apparently called for every task
                 # invocation. Can't wrap every celery task for every invocation
@@ -63,6 +70,10 @@ class CeleryIntegration(Integration):
             return _wrap_tracer(task, old_build_tracer(name, task, *args, **kwargs))
 
         trace.build_tracer = sentry_build_tracer
+
+        from celery.app.task import Task  # type: ignore
+
+        Task.apply_async = _wrap_apply_async(Task.apply_async)
 
         _patch_worker_exit()
 
@@ -77,23 +88,32 @@ class CeleryIntegration(Integration):
         ignore_logger("celery.redirected")
 
 
-def _wrap_apply_async(task, f):
-    # type: (Any, F) -> F
-    @functools.wraps(f)
+def _wrap_apply_async(f):
+    # type: (F) -> F
+    @wraps(f)
     def apply_async(*args, **kwargs):
         # type: (*Any, **Any) -> Any
         hub = Hub.current
         integration = hub.get_integration(CeleryIntegration)
         if integration is not None and integration.propagate_traces:
-            headers = None
-            for key, value in hub.iter_trace_propagation_headers():
-                if headers is None:
-                    headers = dict(kwargs.get("headers") or {})
-                headers[key] = value
-            if headers is not None:
-                kwargs["headers"] = headers
+            with hub.start_span(op="celery.submit", description=args[0].name) as span:
+                with capture_internal_exceptions():
+                    headers = dict(hub.iter_trace_propagation_headers(span))
 
-            with hub.start_span(op="celery.submit", description=task.name):
+                    if headers:
+                        # Note: kwargs can contain headers=None, so no setdefault!
+                        # Unsure which backend though.
+                        kwarg_headers = kwargs.get("headers") or {}
+                        kwarg_headers.update(headers)
+
+                        # https://github.com/celery/celery/issues/4875
+                        #
+                        # Need to setdefault the inner headers too since other
+                        # tracing tools (dd-trace-py) also employ this exact
+                        # workaround and we don't want to break them.
+                        kwarg_headers.setdefault("headers", {}).update(headers)
+                        kwargs["headers"] = kwarg_headers
+
                 return f(*args, **kwargs)
         else:
             return f(*args, **kwargs)
@@ -110,7 +130,7 @@ def _wrap_tracer(task, f):
     # This is the reason we don't use signals for hooking in the first place.
     # Also because in Celery 3, signal dispatch returns early if one handler
     # crashes.
-    @functools.wraps(f)
+    @wraps(f)
     def _inner(*args, **kwargs):
         # type: (*Any, **Any) -> Any
         hub = Hub.current
@@ -122,16 +142,35 @@ def _wrap_tracer(task, f):
             scope.clear_breadcrumbs()
             scope.add_event_processor(_make_event_processor(task, *args, **kwargs))
 
-            span = Span.continue_from_headers(args[3].get("headers") or {})
-            span.op = "celery.task"
-            span.transaction = "unknown celery task"
+            transaction = None
 
+            # Celery task objects are not a thing to be trusted. Even
+            # something such as attribute access can fail.
             with capture_internal_exceptions():
-                # Celery task objects are not a thing to be trusted. Even
-                # something such as attribute access can fail.
-                span.transaction = task.name
+                transaction = Transaction.continue_from_headers(
+                    args[3].get("headers") or {},
+                    op="celery.task",
+                    name="unknown celery task",
+                )
 
-            with hub.start_span(span):
+                transaction.name = task.name
+                transaction.set_status("ok")
+
+            if transaction is None:
+                return f(*args, **kwargs)
+
+            with hub.start_transaction(
+                transaction,
+                custom_sampling_context={
+                    "celery_job": {
+                        "task": task.name,
+                        # for some reason, args[1] is a list if non-empty but a
+                        # tuple if empty
+                        "args": list(args[1]),
+                        "kwargs": args[2],
+                    }
+                },
+            ):
                 return f(*args, **kwargs)
 
     return _inner  # type: ignore
@@ -146,7 +185,7 @@ def _wrap_task_call(task, f):
     # functools.wraps is important here because celery-once looks at this
     # method's name.
     # https://github.com/getsentry/sentry-python/issues/421
-    @functools.wraps(f)
+    @wraps(f)
     def _inner(*args, **kwargs):
         # type: (*Any, **Any) -> Any
         try:
@@ -166,6 +205,8 @@ def _make_event_processor(task, uuid, args, kwargs, request=None):
         # type: (Event, Hint) -> Optional[Event]
 
         with capture_internal_exceptions():
+            tags = event.setdefault("tags", {})
+            tags["celery_task_id"] = uuid
             extra = event.setdefault("extra", {})
             extra["celery-job"] = {
                 "task_name": task.name,
@@ -194,7 +235,12 @@ def _capture_exception(task, exc_info):
     if hub.get_integration(CeleryIntegration) is None:
         return
     if isinstance(exc_info[1], CELERY_CONTROL_FLOW_EXCEPTIONS):
+        # ??? Doesn't map to anything
+        _set_status(hub, "aborted")
         return
+
+    _set_status(hub, "internal_error")
+
     if hasattr(task, "throws") and isinstance(exc_info[1], task.throws):
         return
 
@@ -209,10 +255,13 @@ def _capture_exception(task, exc_info):
 
     hub.capture_event(event, hint=hint)
 
+
+def _set_status(hub, status):
+    # type: (Hub, str) -> None
     with capture_internal_exceptions():
         with hub.configure_scope() as scope:
             if scope.span is not None:
-                scope.span.set_failure()
+                scope.span.set_status(status)
 
 
 def _patch_worker_exit():

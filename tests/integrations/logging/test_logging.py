@@ -3,7 +3,7 @@ import sys
 import pytest
 import logging
 
-from sentry_sdk.integrations.logging import LoggingIntegration
+from sentry_sdk.integrations.logging import LoggingIntegration, ignore_logger
 
 other_logger = logging.getLogger("testfoo")
 logger = logging.getLogger(__name__)
@@ -22,25 +22,30 @@ def test_logging_works_with_many_loggers(sentry_init, capture_events, logger):
 
     logger.info("bread")
     logger.critical("LOL")
-    event, = events
+    (event,) = events
     assert event["level"] == "fatal"
     assert not event["logentry"]["params"]
     assert event["logentry"]["message"] == "LOL"
-    assert any(crumb["message"] == "bread" for crumb in event["breadcrumbs"])
+    assert any(crumb["message"] == "bread" for crumb in event["breadcrumbs"]["values"])
 
 
 @pytest.mark.parametrize("integrations", [None, [], [LoggingIntegration()]])
-def test_logging_defaults(integrations, sentry_init, capture_events):
+@pytest.mark.parametrize(
+    "kwargs", [{"exc_info": None}, {}, {"exc_info": 0}, {"exc_info": False}]
+)
+def test_logging_defaults(integrations, sentry_init, capture_events, kwargs):
     sentry_init(integrations=integrations)
     events = capture_events()
 
     logger.info("bread")
-    logger.critical("LOL")
-    event, = events
+    logger.critical("LOL", **kwargs)
+    (event,) = events
 
     assert event["level"] == "fatal"
-    assert any(crumb["message"] == "bread" for crumb in event["breadcrumbs"])
-    assert not any(crumb["message"] == "LOL" for crumb in event["breadcrumbs"])
+    assert any(crumb["message"] == "bread" for crumb in event["breadcrumbs"]["values"])
+    assert not any(
+        crumb["message"] == "LOL" for crumb in event["breadcrumbs"]["values"]
+    )
     assert "threads" not in event
 
 
@@ -51,13 +56,13 @@ def test_logging_extra_data(sentry_init, capture_events):
     logger.info("bread", extra=dict(foo=42))
     logger.critical("lol", extra=dict(bar=69))
 
-    event, = events
+    (event,) = events
 
     assert event["level"] == "fatal"
     assert event["extra"] == {"bar": 69}
     assert any(
         crumb["message"] == "bread" and crumb["data"] == {"foo": 42}
-        for crumb in event["breadcrumbs"]
+        for crumb in event["breadcrumbs"]["values"]
     )
 
 
@@ -67,7 +72,7 @@ def test_logging_extra_data_integer_keys(sentry_init, capture_events):
 
     logger.critical("integer in extra keys", extra={1: 1})
 
-    event, = events
+    (event,) = events
 
     assert event["extra"] == {"1": 1}
 
@@ -80,7 +85,10 @@ def test_logging_stack(sentry_init, capture_events):
     logger.error("first", exc_info=True)
     logger.error("second")
 
-    event_with, event_without, = events
+    (
+        event_with,
+        event_without,
+    ) = events
 
     assert event_with["level"] == "error"
     assert event_with["threads"]["values"][0]["stacktrace"]["frames"]
@@ -95,7 +103,7 @@ def test_logging_level(sentry_init, capture_events):
 
     logger.setLevel(logging.WARNING)
     logger.error("hi")
-    event, = events
+    (event,) = events
     assert event["level"] == "error"
     assert event["logentry"]["message"] == "hi"
 
@@ -124,5 +132,32 @@ def test_logging_filters(sentry_init, capture_events):
     should_log = True
     logger.error("hi")
 
-    event, = events
+    (event,) = events
+    assert event["logentry"]["message"] == "hi"
+
+
+def test_ignore_logger(sentry_init, capture_events):
+    sentry_init(integrations=[LoggingIntegration()], default_integrations=False)
+    events = capture_events()
+
+    ignore_logger("testfoo")
+
+    other_logger.error("hi")
+
+    assert not events
+
+
+def test_ignore_logger_wildcard(sentry_init, capture_events):
+    sentry_init(integrations=[LoggingIntegration()], default_integrations=False)
+    events = capture_events()
+
+    ignore_logger("testfoo.*")
+
+    nested_logger = logging.getLogger("testfoo.submodule")
+
+    logger.error("hi")
+
+    nested_logger.error("bye")
+
+    (event,) = events
     assert event["logentry"]["message"] == "hi"

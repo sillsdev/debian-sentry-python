@@ -4,12 +4,17 @@ import pytest
 
 pytest.importorskip("celery")
 
-from sentry_sdk import Hub, configure_scope
+from sentry_sdk import Hub, configure_scope, start_transaction
 from sentry_sdk.integrations.celery import CeleryIntegration
 from sentry_sdk._compat import text_type
 
 from celery import Celery, VERSION
 from celery.bin import worker
+
+try:
+    from unittest import mock  # python 3.3 and above
+except ImportError:
+    import mock  # python < 3.3
 
 
 @pytest.fixture
@@ -22,17 +27,51 @@ def connect_signal(request):
 
 
 @pytest.fixture
-def init_celery(sentry_init):
-    def inner(propagate_traces=True, **kwargs):
+def init_celery(sentry_init, request):
+    def inner(propagate_traces=True, backend="always_eager", **kwargs):
         sentry_init(
             integrations=[CeleryIntegration(propagate_traces=propagate_traces)],
             **kwargs
         )
         celery = Celery(__name__)
-        if VERSION < (4,):
-            celery.conf.CELERY_ALWAYS_EAGER = True
+
+        if backend == "always_eager":
+            if VERSION < (4,):
+                celery.conf.CELERY_ALWAYS_EAGER = True
+            else:
+                celery.conf.task_always_eager = True
+        elif backend == "redis":
+            # broken on celery 3
+            if VERSION < (4,):
+                pytest.skip("Redis backend broken for some reason")
+
+            # this backend requires capture_events_forksafe
+            celery.conf.worker_max_tasks_per_child = 1
+            celery.conf.worker_concurrency = 1
+            celery.conf.broker_url = "redis://127.0.0.1:6379"
+            celery.conf.result_backend = "redis://127.0.0.1:6379"
+            celery.conf.task_always_eager = False
+
+            Hub.main.bind_client(Hub.current.client)
+            request.addfinalizer(lambda: Hub.main.bind_client(None))
+
+            # Once we drop celery 3 we can use the celery_worker fixture
+            if VERSION < (5,):
+                worker_fn = worker.worker(app=celery).run
+            else:
+                from celery.bin.base import CLIContext
+
+                worker_fn = lambda: worker.worker(
+                    obj=CLIContext(app=celery, no_color=True, workdir=".", quiet=False),
+                    args=[],
+                )
+
+            worker_thread = threading.Thread(target=worker_fn)
+            worker_thread.daemon = True
+            worker_thread.start()
         else:
-            celery.conf.task_always_eager = True
+            raise ValueError(backend)
+
         return celery
 
     return inner
@@ -74,20 +113,21 @@ def test_simple(capture_events, celery, celery_invocation):
         foo = 42  # noqa
         return x / y
 
-    with Hub.current.start_span() as span:
+    with start_transaction() as transaction:
         celery_invocation(dummy_task, 1, 2)
         _, expected_context = celery_invocation(dummy_task, 1, 0)
 
-    event, = events
+    (event,) = events
 
-    assert event["contexts"]["trace"]["trace_id"] == span.trace_id
-    assert event["contexts"]["trace"]["span_id"] != span.span_id
+    assert event["contexts"]["trace"]["trace_id"] == transaction.trace_id
+    assert event["contexts"]["trace"]["span_id"] != transaction.span_id
     assert event["transaction"] == "dummy_task"
+    assert "celery_task_id" in event["tags"]
     assert event["extra"]["celery-job"] == dict(
         task_name="dummy_task", **expected_context
     )
 
-    exception, = event["exception"]["values"]
+    (exception,) = event["exception"]["values"]
     assert exception["type"] == "ZeroDivisionError"
     assert exception["mechanism"]["type"] == "celery"
     assert exception["stacktrace"]["frames"][0]["vars"]["foo"] == "42"
@@ -106,12 +146,12 @@ def test_transaction_events(capture_events, init_celery, celery_invocation, task
 
     events = capture_events()
 
-    with Hub.current.start_span(transaction="submission") as span:
+    with start_transaction(name="submission") as transaction:
         celery_invocation(dummy_task, 1, 0 if task_fails else 1)
 
     if task_fails:
         error_event = events.pop(0)
-        assert error_event["contexts"]["trace"]["trace_id"] == span.trace_id
+        assert error_event["contexts"]["trace"]["trace_id"] == transaction.trace_id
         assert error_event["exception"]["values"][0]["type"] == "ZeroDivisionError"
 
     execution_event, submission_event = events
@@ -120,13 +160,13 @@ def test_transaction_events(capture_events, init_celery, celery_invocation, task
     assert submission_event["transaction"] == "submission"
 
     assert execution_event["type"] == submission_event["type"] == "transaction"
-    assert execution_event["contexts"]["trace"]["trace_id"] == span.trace_id
-    assert submission_event["contexts"]["trace"]["trace_id"] == span.trace_id
+    assert execution_event["contexts"]["trace"]["trace_id"] == transaction.trace_id
+    assert submission_event["contexts"]["trace"]["trace_id"] == transaction.trace_id
 
     if task_fails:
-        assert execution_event["contexts"]["trace"]["status"] == "failure"
+        assert execution_event["contexts"]["trace"]["status"] == "internal_error"
     else:
-        assert "status" not in execution_event["contexts"]["trace"]
+        assert execution_event["contexts"]["trace"]["status"] == "ok"
 
     assert execution_event["spans"] == []
     assert submission_event["spans"] == [
@@ -138,7 +178,7 @@ def test_transaction_events(capture_events, init_celery, celery_invocation, task
             u"span_id": submission_event["spans"][0]["span_id"],
             u"start_timestamp": submission_event["spans"][0]["start_timestamp"],
             u"timestamp": submission_event["spans"][0]["timestamp"],
-            u"trace_id": text_type(span.trace_id),
+            u"trace_id": text_type(transaction.trace_id),
         }
     ]
 
@@ -176,13 +216,13 @@ def test_simple_no_propagation(capture_events, init_celery):
     def dummy_task():
         1 / 0
 
-    with Hub.current.start_span() as span:
+    with start_transaction() as transaction:
         dummy_task.delay()
 
-    event, = events
-    assert event["contexts"]["trace"]["trace_id"] != span.trace_id
+    (event,) = events
+    assert event["contexts"]["trace"]["trace_id"] != transaction.trace_id
     assert event["transaction"] == "dummy_task"
-    exception, = event["exception"]["values"]
+    (exception,) = event["exception"]["values"]
     assert exception["type"] == "ZeroDivisionError"
 
 
@@ -235,7 +275,7 @@ def test_broken_prerun(init_celery, connect_signal):
 
 
 @pytest.mark.xfail(
-    (4, 2, 0) <= VERSION,
+    (4, 2, 0) <= VERSION < (4, 4, 3),
     strict=True,
     reason="https://github.com/celery/celery/issues/4661",
 )
@@ -264,7 +304,7 @@ def test_retry(celery, capture_events):
     dummy_task.delay()
 
     assert len(runs) == 3
-    event, = events
+    (event,) = events
     exceptions = event["exception"]["values"]
 
     for e in exceptions:
@@ -272,15 +312,10 @@ def test_retry(celery, capture_events):
 
 
 @pytest.mark.forked
-@pytest.mark.skipif(VERSION < (4,), reason="in-memory backend broken")
-def test_transport_shutdown(request, celery, capture_events_forksafe, tmpdir):
-    events = capture_events_forksafe()
+def test_redis_backend_trace_propagation(init_celery, capture_events_forksafe, tmpdir):
+    celery = init_celery(traces_sample_rate=1.0, backend="redis", debug=True)
 
-    celery.conf.worker_max_tasks_per_child = 1
-    celery.conf.broker_url = "memory://localhost/"
-    celery.conf.broker_backend = "memory"
-    celery.conf.result_backend = "file://{}".format(tmpdir.mkdir("celery-results"))
-    celery.conf.task_always_eager = False
+    events = capture_events_forksafe()
 
     runs = []
 
@@ -289,22 +324,86 @@ def test_transport_shutdown(request, celery, capture_events_forksafe, tmpdir):
         runs.append(1)
         1 / 0
 
-    res = dummy_task.delay()
-
-    w = worker.worker(app=celery)
-    t = threading.Thread(target=w.run)
-    t.daemon = True
-    t.start()
+    with start_transaction(name="submit_celery"):
+        # Curious: Cannot use delay() here or py2.7-celery-4.2 crashes
+        res = dummy_task.apply_async()
 
     with pytest.raises(Exception):
         # Celery 4.1 raises a gibberish exception
         res.wait()
 
+    # if this is nonempty, the worker never really forked
+    assert not runs
+
+    submit_transaction = events.read_event()
+    assert submit_transaction["type"] == "transaction"
+    assert submit_transaction["transaction"] == "submit_celery"
+    (span,) = submit_transaction["spans"]
+    assert span["op"] == "celery.submit"
+    assert span["description"] == "dummy_task"
+
     event = events.read_event()
-    exception, = event["exception"]["values"]
+    (exception,) = event["exception"]["values"]
     assert exception["type"] == "ZeroDivisionError"
+
+    transaction = events.read_event()
+    assert (
+        transaction["contexts"]["trace"]["trace_id"]
+        == event["contexts"]["trace"]["trace_id"]
+        == submit_transaction["contexts"]["trace"]["trace_id"]
+    )
 
     events.read_flush()
 
     # if this is nonempty, the worker never really forked
     assert not runs
+
+
+@pytest.mark.forked
+@pytest.mark.parametrize("newrelic_order", ["sentry_first", "sentry_last"])
+def test_newrelic_interference(init_celery, newrelic_order, celery_invocation):
+    def instrument_newrelic():
+        import celery.app.trace as celery_mod
+        from newrelic.hooks.application_celery import instrument_celery_execute_trace
+
+        assert hasattr(celery_mod, "build_tracer")
+        instrument_celery_execute_trace(celery_mod)
+
+    if newrelic_order == "sentry_first":
+        celery = init_celery()
+        instrument_newrelic()
+    elif newrelic_order == "sentry_last":
+        instrument_newrelic()
+        celery = init_celery()
+    else:
+        raise ValueError(newrelic_order)
+
+    @celery.task(name="dummy_task", bind=True)
+    def dummy_task(self, x, y):
+        return x / y
+
+    assert dummy_task.apply(kwargs={"x": 1, "y": 1}).wait() == 1
+    assert celery_invocation(dummy_task, 1, 1)[0].wait() == 1
+
+
+def test_traces_sampler_gets_task_info_in_sampling_context(
+    init_celery, celery_invocation, DictionaryContaining  # noqa:N803
+):
+    traces_sampler = mock.Mock()
+    celery = init_celery(traces_sampler=traces_sampler)
+
+    @celery.task(name="dog_walk")
+    def walk_dogs(x, y):
+        dogs, route = x
+        num_loops = y
+        return dogs, route, num_loops
+
+    _, args_kwargs = celery_invocation(
+        walk_dogs, [["Maisey", "Charlie", "Bodhi", "Cory"], "Dog park round trip"], 1
+    )
+
+    traces_sampler.assert_any_call(
+        # depending on the iteration of celery_invocation, the data might be
+        # passed as args or as kwargs, so make this generic
+        DictionaryContaining({"celery_job": dict(task="dog_walk", **args_kwargs)})
+    )

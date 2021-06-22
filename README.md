@@ -4,6 +4,8 @@
     </a>
 </p>
 
+_Bad software is everywhere, and we're tired of it. Sentry is on a mission to help developers write better software faster, so we can get back to enjoying technology. If you want to join us [<kbd>**Check out our open positions**</kbd>](https://sentry.io/careers/)_
+
 # sentry-python - Sentry SDK for Python
 
 [![Build Status](https://travis-ci.com/getsentry/sentry-python.svg?branch=master)](https://travis-ci.com/getsentry/sentry-python)
@@ -22,21 +24,14 @@ capture_message("Hello World")  # Will create an event.
 raise ValueError()  # Will also create an event.
 ```
 
-To learn more about how to use the SDK:
+- To learn more about how to use the SDK [refer to our docs](https://docs.sentry.io/platforms/python/)
+- Are you coming from raven-python? [Use this cheatsheet](https://docs.sentry.io/platforms/python/migration/)
+- To learn about internals use the [API Reference](https://getsentry.github.io/sentry-python/)
 
-- [Getting started with the new SDK](https://docs.sentry.io/quickstart/?platform=python)
-- [Configuration options](https://docs.sentry.io/error-reporting/configuration/?platform=python)
-- [Setting context (tags, user, extra information)](https://docs.sentry.io/enriching-error-data/context/?platform=python)
-- [Integrations](https://docs.sentry.io/platforms/python/)
+# Contributing to the SDK
 
-Are you coming from raven-python?
-
-- [Cheatsheet: Migrating to the new SDK from Raven](https://forum.sentry.io/t/switching-to-sentry-python/4733)
-
-To learn about internals:
-
-- [API Reference](https://getsentry.github.io/sentry-python/)
+Please refer to [CONTRIBUTING.md](https://github.com/getsentry/sentry-python/blob/master/CONTRIBUTING.md).
 
 # License
 
-Licensed under the BSD license, see `LICENSE`
+Licensed under the BSD license, see [`LICENSE`](https://github.com/getsentry/sentry-python/blob/master/LICENSE)

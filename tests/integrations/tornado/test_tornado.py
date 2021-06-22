@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from sentry_sdk import configure_scope
+from sentry_sdk import configure_scope, start_transaction
 from sentry_sdk.integrations.tornado import TornadoIntegration
 
 from tornado.web import RequestHandler, Application, HTTPError
@@ -37,8 +37,27 @@ def tornado_testcase(request):
 class CrashingHandler(RequestHandler):
     def get(self):
         with configure_scope() as scope:
-            scope.set_tag("foo", 42)
+            scope.set_tag("foo", "42")
         1 / 0
+
+    def post(self):
+        with configure_scope() as scope:
+            scope.set_tag("foo", "43")
+        1 / 0
+
+
+class HelloHandler(RequestHandler):
+    async def get(self):
+        with configure_scope() as scope:
+            scope.set_tag("foo", "42")
+
+        return b"hello"
+
+    async def post(self):
+        with configure_scope() as scope:
+            scope.set_tag("foo", "43")
+
+        return b"hello"
 
 
 def test_basic(tornado_testcase, sentry_init, capture_events):
@@ -51,9 +70,10 @@ def test_basic(tornado_testcase, sentry_init, capture_events):
     )
     assert response.code == 500
 
-    event, = events
-    exception, = event["exception"]["values"]
+    (event,) = events
+    (exception,) = event["exception"]["values"]
     assert exception["type"] == "ZeroDivisionError"
+    assert exception["mechanism"]["type"] == "tornado"
 
     request = event["request"]
     host = request["headers"]["Host"]
@@ -62,8 +82,8 @@ def test_basic(tornado_testcase, sentry_init, capture_events):
         "headers": {
             "Accept-Encoding": "gzip",
             "Connection": "close",
-            "Host": host,
             "Cookie": "name=value; name2=value2; name3=value3",
+            **request["headers"],
         },
         "cookies": {"name": "value", "name2": "value2", "name3": "value3"},
         "method": "GET",
@@ -71,7 +91,7 @@ def test_basic(tornado_testcase, sentry_init, capture_events):
         "url": "http://{host}/hi".format(host=host),
     }
 
-    assert event["tags"] == {"foo": 42}
+    assert event["tags"] == {"foo": "42"}
     assert (
         event["transaction"]
         == "tests.integrations.tornado.test_tornado.CrashingHandler.get"
@@ -79,6 +99,82 @@ def test_basic(tornado_testcase, sentry_init, capture_events):
 
     with configure_scope() as scope:
         assert not scope._tags
+
+
+@pytest.mark.parametrize(
+    "handler,code",
+    [
+        (CrashingHandler, 500),
+        (HelloHandler, 200),
+    ],
+)
+def test_transactions(tornado_testcase, sentry_init, capture_events, handler, code):
+    sentry_init(integrations=[TornadoIntegration()], traces_sample_rate=1.0, debug=True)
+    events = capture_events()
+    client = tornado_testcase(Application([(r"/hi", handler)]))
+
+    with start_transaction(name="client") as span:
+        pass
+
+    response = client.fetch(
+        "/hi", method="POST", body=b"heyoo", headers=dict(span.iter_headers())
+    )
+    assert response.code == code
+
+    if code == 200:
+        client_tx, server_tx = events
+        server_error = None
+    else:
+        client_tx, server_error, server_tx = events
+
+    assert client_tx["type"] == "transaction"
+    assert client_tx["transaction"] == "client"
+
+    if server_error is not None:
+        assert server_error["exception"]["values"][0]["type"] == "ZeroDivisionError"
+        assert (
+            server_error["transaction"]
+            == "tests.integrations.tornado.test_tornado.CrashingHandler.post"
+        )
+
+    if code == 200:
+        assert (
+            server_tx["transaction"]
+            == "tests.integrations.tornado.test_tornado.HelloHandler.post"
+        )
+    else:
+        assert (
+            server_tx["transaction"]
+            == "tests.integrations.tornado.test_tornado.CrashingHandler.post"
+        )
+
+    assert server_tx["type"] == "transaction"
+
+    request = server_tx["request"]
+    host = request["headers"]["Host"]
+    assert server_tx["request"] == {
+        "env": {"REMOTE_ADDR": "127.0.0.1"},
+        "headers": {
+            "Accept-Encoding": "gzip",
+            "Connection": "close",
+            **request["headers"],
+        },
+        "method": "POST",
+        "query_string": "",
+        "data": {"heyoo": [""]},
+        "url": "http://{host}/hi".format(host=host),
+    }
+
+    assert (
+        client_tx["contexts"]["trace"]["trace_id"]
+        == server_tx["contexts"]["trace"]["trace_id"]
+    )
+
+    if server_error is not None:
+        assert (
+            server_error["contexts"]["trace"]["trace_id"]
+            == server_tx["contexts"]["trace"]["trace_id"]
+        )
 
 
 def test_400_not_logged(tornado_testcase, sentry_init, capture_events):
@@ -120,8 +216,8 @@ def test_user_auth(tornado_testcase, sentry_init, capture_events):
     response = client.fetch("/auth")
     assert response.code == 500
 
-    event, = events
-    exception, = event["exception"]["values"]
+    (event,) = events
+    (exception,) = event["exception"]["values"]
     assert exception["type"] == "ZeroDivisionError"
 
     assert event["user"] == {"is_authenticated": True}
@@ -132,8 +228,8 @@ def test_user_auth(tornado_testcase, sentry_init, capture_events):
     response = client.fetch("/noauth")
     assert response.code == 500
 
-    event, = events
-    exception, = event["exception"]["values"]
+    (event,) = events
+    (exception,) = event["exception"]["values"]
     assert exception["type"] == "ZeroDivisionError"
 
     assert "user" not in event
@@ -158,8 +254,8 @@ def test_formdata(tornado_testcase, sentry_init, capture_events):
 
     assert response.code == 500
 
-    event, = events
-    exception, = event["exception"]["values"]
+    (event,) = events
+    (exception,) = event["exception"]["values"]
     assert exception["value"] == '["field1", "field2"]'
     assert event["request"]["data"] == {"field1": ["value1"], "field2": ["value2"]}
 
@@ -185,8 +281,8 @@ def test_json(tornado_testcase, sentry_init, capture_events):
 
     assert response.code == 500
 
-    event, = events
-    exception, = event["exception"]["values"]
+    (event,) = events
+    (exception,) = event["exception"]["values"]
     assert exception["value"] == "[]"
     assert event
     assert event["request"]["data"] == {"foo": {"bar": 42}}

@@ -1,7 +1,10 @@
-import os
-import sys
+import json
 import linecache
 import logging
+import os
+import sys
+import threading
+import subprocess
 
 from datetime import datetime
 
@@ -25,7 +28,8 @@ if MYPY:
     from typing import Union
     from typing import Type
 
-    from sentry_sdk._types import ExcInfo
+    from sentry_sdk._types import ExcInfo, EndpointType
+
 
 epoch = datetime(1970, 1, 1)
 
@@ -37,10 +41,55 @@ MAX_STRING_LENGTH = 512
 MAX_FORMAT_PARAM_LENGTH = 128
 
 
+def json_dumps(data):
+    # type: (Any) -> bytes
+    """Serialize data into a compact JSON representation encoded as UTF-8."""
+    return json.dumps(data, allow_nan=False, separators=(",", ":")).encode("utf-8")
+
+
 def _get_debug_hub():
     # type: () -> Optional[sentry_sdk.Hub]
     # This function is replaced by debug.py
     pass
+
+
+def get_default_release():
+    # type: () -> Optional[str]
+    """Try to guess a default release."""
+    release = os.environ.get("SENTRY_RELEASE")
+    if release:
+        return release
+
+    with open(os.path.devnull, "w+") as null:
+        try:
+            release = (
+                subprocess.Popen(
+                    ["git", "rev-parse", "HEAD"],
+                    stdout=subprocess.PIPE,
+                    stderr=null,
+                    stdin=null,
+                )
+                .communicate()[0]
+                .strip()
+                .decode("utf-8")
+            )
+        except (OSError, IOError):
+            pass
+
+        if release:
+            return release
+
+    for var in (
+        "HEROKU_SLUG_COMMIT",
+        "SOURCE_VERSION",
+        "CODEBUILD_RESOLVED_SOURCE_VERSION",
+        "CIRCLE_SHA1",
+        "GAE_DEPLOYMENT_ID",
+    ):
+        release = os.environ.get(var)
+        if release:
+            return release
+    return None
 
 
 class CaptureInternalException(object):
@@ -76,6 +125,11 @@ def capture_internal_exception(exc_info):
 def to_timestamp(value):
     # type: (datetime) -> float
     return (value - epoch).total_seconds()
+
+
+def format_timestamp(value):
+    # type: (datetime) -> str
+    return value.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 def event_hint_with_exc_info(exc_info=None):
@@ -195,12 +249,23 @@ class Auth(object):
     @property
     def store_api_url(self):
         # type: () -> str
+        """Returns the API url for storing events.
+
+        Deprecated: use get_api_url instead.
+        """
+        return self.get_api_url(type="store")
+
+    def get_api_url(
+        self, type="store"  # type: EndpointType
+    ):
+        # type: (...) -> str
         """Returns the API url for storing events."""
-        return "%s://%s%sapi/%s/store/" % (
+        return "%s://%s%sapi/%s/%s/" % (
             self.scheme,
             self.host,
             self.path,
             self.project_id,
+            type,
         )
 
     def to_header(self, timestamp=None):
@@ -348,32 +413,42 @@ def safe_str(value):
         return safe_repr(value)
 
 
-def safe_repr(value):
-    # type: (Any) -> str
-    try:
-        rv = repr(value)
-        if isinstance(rv, bytes):
-            rv = rv.decode("utf-8", "replace")
+if PY2:
 
-        # At this point `rv` contains a bunch of literal escape codes, like
-        # this (exaggerated example):
-        #
-        # u"\\x2f"
-        #
-        # But we want to show this string as:
-        #
-        # u"/"
+    def safe_repr(value):
+        # type: (Any) -> str
         try:
-            # unicode-escape does this job, but can only decode latin1. So we
-            # attempt to encode in latin1.
-            return rv.encode("latin1").decode("unicode-escape")
+            rv = repr(value).decode("utf-8", "replace")
+
+            # At this point `rv` contains a bunch of literal escape codes, like
+            # this (exaggerated example):
+            #
+            # u"\\x2f"
+            #
+            # But we want to show this string as:
+            #
+            # u"/"
+            try:
+                # unicode-escape does this job, but can only decode latin1. So we
+                # attempt to encode in latin1.
+                return rv.encode("latin1").decode("unicode-escape")
+            except Exception:
+                # Since usually strings aren't latin1 this can break. In those
+                # cases we just give up.
+                return rv
         except Exception:
-            # Since usually strings aren't latin1 this can break. In those
-            # cases we just give up.
-            return rv
-    except Exception:
-        # If e.g. the call to `repr` already fails
-        return u"<broken repr>"
+            # If e.g. the call to `repr` already fails
+            return u"<broken repr>"
+
+
+else:
+
+    def safe_repr(value):
+        # type: (Any) -> str
+        try:
+            return repr(value)
+        except Exception:
+            return "<broken repr>"
 
 
 def filename_for_module(module, abs_path):
@@ -432,24 +507,12 @@ def serialize_frame(frame, tb_lineno=None, with_locals=True):
     return rv
 
 
-def stacktrace_from_traceback(tb=None, with_locals=True):
-    # type: (Optional[TracebackType], bool) -> Dict[str, List[Dict[str, Any]]]
-    return {
-        "frames": [
-            serialize_frame(
-                tb.tb_frame, tb_lineno=tb.tb_lineno, with_locals=with_locals
-            )
-            for tb in iter_stacks(tb)
-        ]
-    }
-
-
 def current_stacktrace(with_locals=True):
     # type: (bool) -> Any
     __tracebackhide__ = True
     frames = []
 
-    f = sys._getframe()
+    f = sys._getframe()  # type: Optional[FrameType]
     while f is not None:
         if not should_hide_frame(f):
             frames.append(serialize_frame(f, with_locals=with_locals))
@@ -479,7 +542,7 @@ def single_exception_from_error_tuple(
         errno = None
 
     if errno is not None:
-        mechanism = mechanism or {}
+        mechanism = mechanism or {"type": "generic"}
         mechanism.setdefault("meta", {}).setdefault("errno", {}).setdefault(
             "number", errno
         )
@@ -489,13 +552,22 @@ def single_exception_from_error_tuple(
     else:
         with_locals = client_options["with_locals"]
 
-    return {
+    frames = [
+        serialize_frame(tb.tb_frame, tb_lineno=tb.tb_lineno, with_locals=with_locals)
+        for tb in iter_stacks(tb)
+    ]
+
+    rv = {
         "module": get_type_module(exc_type),
         "type": get_type_name(exc_type),
         "value": safe_str(exc_value),
         "mechanism": mechanism,
-        "stacktrace": stacktrace_from_traceback(tb, with_locals),
     }
+
+    if frames:
+        rv["stacktrace"] = {"frames": frames}
+
+    return rv
 
 
 HAS_CHAINED_EXCEPTIONS = hasattr(Exception, "__suppress_context__")
@@ -648,7 +720,7 @@ def exc_info_from_error(error):
                 exc_type = type(error)
 
     else:
-        raise ValueError()
+        raise ValueError("Expected Exception object to report, got %s!" % type(error))
 
     return exc_type, exc_value, tb
 
@@ -707,12 +779,20 @@ def strip_string(value, max_length=None):
     return value
 
 
-def _is_threading_local_monkey_patched():
+def _is_contextvars_broken():
     # type: () -> bool
+    """
+    Returns whether gevent/eventlet have patched the stdlib in a way where thread locals are now more "correct" than contextvars.
+    """
     try:
         from gevent.monkey import is_object_patched  # type: ignore
 
         if is_object_patched("threading", "local"):
+            # Gevent 20.5 is able to patch both thread locals and contextvars,
+            # in that case all is good.
+            if is_object_patched("contextvars", "ContextVar"):
+                return False
+
             return True
     except ImportError:
         pass
@@ -728,28 +808,8 @@ def _is_threading_local_monkey_patched():
     return False
 
 
-def _get_contextvars():
-    # type: () -> Tuple[bool, type]
-    """
-    Try to import contextvars and use it if it's deemed safe. We should not use
-    contextvars if gevent or eventlet have patched thread locals, as
-    contextvars are unaffected by that patch.
-
-    https://github.com/gevent/gevent/issues/1407
-    """
-    if not _is_threading_local_monkey_patched():
-        try:
-            from contextvars import ContextVar
-
-            if not PY2 and sys.version_info < (3, 7):
-                import aiocontextvars  # noqa
-
-            return True, ContextVar
-        except ImportError:
-            pass
-
-    from threading import local
-
+def _make_threadlocal_contextvars(local):
+    # type: (type) -> type
     class ContextVar(object):
         # Super-limited impl of ContextVar
 
@@ -766,10 +826,57 @@ def _get_contextvars():
             # type: (Any) -> None
             self._local.value = value
 
-    return False, ContextVar
+    return ContextVar
+
+
+def _get_contextvars():
+    # type: () -> Tuple[bool, type]
+    """
+    Figure out the "right" contextvars installation to use. Returns a
+    `contextvars.ContextVar`-like class with a limited API.
+
+    See https://docs.sentry.io/platforms/python/contextvars/ for more information.
+    """
+    if not _is_contextvars_broken():
+        # aiocontextvars is a PyPI package that ensures that the contextvars
+        # backport (also a PyPI package) works with asyncio under Python 3.6
+        #
+        # Import it if available.
+        if sys.version_info < (3, 7):
+            # `aiocontextvars` is absolutely required for functional
+            # contextvars on Python 3.6.
+            try:
+                from aiocontextvars import ContextVar  # noqa
+
+                return True, ContextVar
+            except ImportError:
+                pass
+        else:
+            # On Python 3.7 contextvars are functional.
+            try:
+                from contextvars import ContextVar
+
+                return True, ContextVar
+            except ImportError:
+                pass
+
+    # Fall back to basic thread-local usage.
+
+    from threading import local
+
+    return False, _make_threadlocal_contextvars(local)
 
 
 HAS_REAL_CONTEXTVARS, ContextVar = _get_contextvars()
+
+CONTEXTVARS_ERROR_MESSAGE = """
+
+With asyncio/ASGI applications, the Sentry SDK requires a functional
+installation of `contextvars` to avoid leaking scope/context data across
+requests.
+
+Please refer to https://docs.sentry.io/platforms/python/contextvars/ for more information.
+"""
 
 
 def transaction_from_function(func):
@@ -805,3 +912,47 @@ def transaction_from_function(func):
 
 
 disable_capture_event = ContextVar("disable_capture_event")
+
+
+class ServerlessTimeoutWarning(Exception):
+    """Raised when a serverless method is about to reach its timeout."""
+
+    pass
+
+
+class TimeoutThread(threading.Thread):
+    """Creates a Thread which runs (sleeps) for a time duration equal to
+    waiting_time and raises a custom ServerlessTimeout exception.
+    """
+
+    def __init__(self, waiting_time, configured_timeout):
+        # type: (float, int) -> None
+        threading.Thread.__init__(self)
+        self.waiting_time = waiting_time
+        self.configured_timeout = configured_timeout
+        self._stop_event = threading.Event()
+
+    def stop(self):
+        # type: () -> None
+        self._stop_event.set()
+
+    def run(self):
+        # type: () -> None
+
+        self._stop_event.wait(self.waiting_time)
+
+        if self._stop_event.is_set():
+            return
+
+        integer_configured_timeout = int(self.configured_timeout)
+
+        # Setting up the exact integer value of configured time(in seconds)
+        if integer_configured_timeout < self.configured_timeout:
+            integer_configured_timeout = integer_configured_timeout + 1
+
+        # Raising Exception after timeout duration is reached
+        raise ServerlessTimeoutWarning(
+            "WARNING : Function is expected to get timed out. Configured timeout duration = {} seconds.".format(
+                integer_configured_timeout
+            )
+        )
