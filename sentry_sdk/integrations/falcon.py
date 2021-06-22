@@ -1,9 +1,7 @@
 from __future__ import absolute_import
 
-import falcon  # type: ignore
-import falcon.api_helpers  # type: ignore
 from sentry_sdk.hub import Hub
-from sentry_sdk.integrations import Integration
+from sentry_sdk.integrations import Integration, DidNotEnable
 from sentry_sdk.integrations._wsgi_common import RequestExtractor
 from sentry_sdk.integrations.wsgi import SentryWsgiMiddleware
 from sentry_sdk.utils import capture_internal_exceptions, event_from_exception
@@ -16,6 +14,14 @@ if MYPY:
     from typing import Optional
 
     from sentry_sdk._types import EventProcessor
+
+try:
+    import falcon  # type: ignore
+    import falcon.api_helpers  # type: ignore
+
+    from falcon import __version__ as FALCON_VERSION
+except ImportError:
+    raise DidNotEnable("Falcon not installed")
 
 
 class FalconRequestExtractor(RequestExtractor):
@@ -75,6 +81,9 @@ class SentryFalconMiddleware(object):
             scope.add_event_processor(_make_request_event_processor(req, integration))
 
 
+TRANSACTION_STYLE_VALUES = ("uri_template", "path")
+
+
 class FalconIntegration(Integration):
     identifier = "falcon"
 
@@ -82,7 +91,6 @@ class FalconIntegration(Integration):
 
     def __init__(self, transaction_style="uri_template"):
         # type: (str) -> None
-        TRANSACTION_STYLE_VALUES = ("uri_template", "path")
         if transaction_style not in TRANSACTION_STYLE_VALUES:
             raise ValueError(
                 "Invalid value for transaction_style: %s (must be in %s)"
@@ -93,6 +101,14 @@ class FalconIntegration(Integration):
     @staticmethod
     def setup_once():
         # type: () -> None
+        try:
+            version = tuple(map(int, FALCON_VERSION.split(".")))
+        except (ValueError, TypeError):
+            raise DidNotEnable("Unparsable Falcon version: {}".format(FALCON_VERSION))
+
+        if version < (1, 4):
+            raise DidNotEnable("Falcon 1.4 or newer required.")
+
         _patch_wsgi_app()
         _patch_handle_exception()
         _patch_prepare_middleware()

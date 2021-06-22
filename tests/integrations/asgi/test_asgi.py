@@ -1,11 +1,17 @@
 import sys
 
 import pytest
-from sentry_sdk import capture_message
+from sentry_sdk import Hub, capture_message, last_event_id
 from sentry_sdk.integrations.asgi import SentryAsgiMiddleware
 from starlette.applications import Starlette
 from starlette.responses import PlainTextResponse
 from starlette.testclient import TestClient
+from starlette.websockets import WebSocket
+
+try:
+    from unittest import mock  # python 3.3 and above
+except ImportError:
+    import mock  # python < 3.3
 
 
 @pytest.fixture
@@ -37,7 +43,7 @@ def test_sync_request_data(sentry_init, app, capture_events):
 
     assert response.status_code == 200
 
-    event, = events
+    (event,) = events
     assert event["transaction"] == "tests.integrations.asgi.test_asgi.app.<locals>.hi"
     assert event["request"]["env"] == {"REMOTE_ADDR": "testclient"}
     assert set(event["request"]["headers"]) == {
@@ -55,7 +61,7 @@ def test_sync_request_data(sentry_init, app, capture_events):
     # Assert that state is not leaked
     events.clear()
     capture_message("foo")
-    event, = events
+    (event,) = events
 
     assert "request" not in event
     assert "transaction" not in event
@@ -70,7 +76,7 @@ def test_async_request_data(sentry_init, app, capture_events):
 
     assert response.status_code == 200
 
-    event, = events
+    (event,) = events
     assert event["transaction"] == "tests.integrations.asgi.test_asgi.app.<locals>.hi2"
     assert event["request"]["env"] == {"REMOTE_ADDR": "testclient"}
     assert set(event["request"]["headers"]) == {
@@ -87,7 +93,7 @@ def test_async_request_data(sentry_init, app, capture_events):
     # Assert that state is not leaked
     events.clear()
     capture_message("foo")
-    event, = events
+    (event,) = events
 
     assert "request" not in event
     assert "transaction" not in event
@@ -106,16 +112,142 @@ def test_errors(sentry_init, app, capture_events):
 
     assert response.status_code == 500
 
-    event, = events
+    (event,) = events
     assert (
         event["transaction"]
         == "tests.integrations.asgi.test_asgi.test_errors.<locals>.myerror"
     )
-    exception, = event["exception"]["values"]
+    (exception,) = event["exception"]["values"]
 
     assert exception["type"] == "ValueError"
     assert exception["value"] == "oh no"
     assert any(
         frame["filename"].endswith("tests/integrations/asgi/test_asgi.py")
         for frame in exception["stacktrace"]["frames"]
+    )
+
+
+def test_websocket(sentry_init, capture_events, request):
+    sentry_init(debug=True, send_default_pii=True)
+
+    # Bind client to main thread because context propagation for the websocket
+    # client does not work.
+    Hub.main.bind_client(Hub.current.client)
+    request.addfinalizer(lambda: Hub.main.bind_client(None))
+
+    events = capture_events()
+
+    from starlette.testclient import TestClient
+
+    def message():
+        capture_message("hi")
+        raise ValueError("oh no")
+
+    async def app(scope, receive, send):
+        assert scope["type"] == "websocket"
+        websocket = WebSocket(scope, receive=receive, send=send)
+        await websocket.accept()
+        await websocket.send_text(message())
+        await websocket.close()
+
+    app = SentryAsgiMiddleware(app)
+
+    client = TestClient(app)
+    with client.websocket_connect("/") as websocket:
+        with pytest.raises(ValueError):
+            websocket.receive_text()
+
+    msg_event, error_event = events
+
+    assert msg_event["message"] == "hi"
+
+    (exc,) = error_event["exception"]["values"]
+    assert exc["type"] == "ValueError"
+    assert exc["value"] == "oh no"
+
+    assert (
+        msg_event["request"]
+        == error_event["request"]
+        == {
+            "env": {"REMOTE_ADDR": "testclient"},
+            "headers": {
+                "accept": "*/*",
+                "accept-encoding": "gzip, deflate",
+                "connection": "upgrade",
+                "host": "testserver",
+                "sec-websocket-key": "testserver==",
+                "sec-websocket-version": "13",
+                "user-agent": "testclient",
+            },
+            "method": None,
+            "query_string": None,
+            "url": "ws://testserver/",
+        }
+    )
+
+
+def test_starlette_last_event_id(app, sentry_init, capture_events, request):
+    sentry_init(send_default_pii=True)
+    events = capture_events()
+
+    @app.route("/handlederror")
+    def handlederror(request):
+        raise ValueError("oh no")
+
+    @app.exception_handler(500)
+    def handler(*args, **kwargs):
+        return PlainTextResponse(last_event_id(), status_code=500)
+
+    client = TestClient(SentryAsgiMiddleware(app), raise_server_exceptions=False)
+    response = client.get("/handlederror")
+    assert response.status_code == 500
+
+    (event,) = events
+    assert response.content.strip().decode("ascii") == event["event_id"]
+    (exception,) = event["exception"]["values"]
+    assert exception["type"] == "ValueError"
+    assert exception["value"] == "oh no"
+
+
+def test_transaction(app, sentry_init, capture_events):
+    sentry_init(traces_sample_rate=1.0)
+    events = capture_events()
+
+    @app.route("/tricks/kangaroo")
+    def kangaroo_handler(request):
+        return PlainTextResponse("dogs are great")
+
+    client = TestClient(app)
+    client.get("/tricks/kangaroo")
+
+    event = events[0]
+    assert event["type"] == "transaction"
+    assert (
+        event["transaction"]
+        == "tests.integrations.asgi.test_asgi.test_transaction.<locals>.kangaroo_handler"
+    )
+
+
+def test_traces_sampler_gets_scope_in_sampling_context(
+    app, sentry_init, DictionaryContaining  # noqa: N803
+):
+    traces_sampler = mock.Mock()
+    sentry_init(traces_sampler=traces_sampler)
+
+    @app.route("/tricks/kangaroo")
+    def kangaroo_handler(request):
+        return PlainTextResponse("dogs are great")
+
+    client = TestClient(app)
+    client.get("/tricks/kangaroo")
+
+    traces_sampler.assert_any_call(
+        DictionaryContaining(
+            {
+                # starlette just uses a dictionary to hold the scope
+                "asgi_scope": DictionaryContaining(
+                    {"method": "GET", "path": "/tricks/kangaroo"}
+                )
+            }
+        )
     )

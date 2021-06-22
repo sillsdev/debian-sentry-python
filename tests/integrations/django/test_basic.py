@@ -9,13 +9,14 @@ from django.contrib.auth.models import User
 from django.core.management import execute_from_command_line
 from django.db.utils import OperationalError, ProgrammingError, DataError
 
+from sentry_sdk.integrations.executing import ExecutingIntegration
 
 try:
     from django.urls import reverse
 except ImportError:
     from django.core.urlresolvers import reverse
 
-from sentry_sdk import capture_message, capture_exception
+from sentry_sdk import capture_message, capture_exception, configure_scope
 from sentry_sdk.integrations.django import DjangoIntegration
 
 from tests.integrations.django.myapp.wsgi import application
@@ -32,11 +33,51 @@ def test_view_exceptions(sentry_init, client, capture_exceptions, capture_events
     events = capture_events()
     client.get(reverse("view_exc"))
 
-    error, = exceptions
+    (error,) = exceptions
     assert isinstance(error, ZeroDivisionError)
 
-    event, = events
+    (event,) = events
     assert event["exception"]["values"][0]["mechanism"]["type"] == "django"
+
+
+def test_ensures_x_forwarded_header_is_honored_in_sdk_when_enabled_in_django(
+    sentry_init, client, capture_exceptions, capture_events, settings
+):
+    """
+    Test that ensures if django settings.USE_X_FORWARDED_HOST is set to True
+    then the SDK sets the request url to the `HTTP_X_FORWARDED_FOR`
+    """
+    settings.USE_X_FORWARDED_HOST = True
+
+    sentry_init(integrations=[DjangoIntegration()], send_default_pii=True)
+    exceptions = capture_exceptions()
+    events = capture_events()
+    client.get(reverse("view_exc"), headers={"X_FORWARDED_HOST": "example.com"})
+
+    (error,) = exceptions
+    assert isinstance(error, ZeroDivisionError)
+
+    (event,) = events
+    assert event["request"]["url"] == "http://example.com/view-exc"
+
+
+def test_ensures_x_forwarded_header_is_not_honored_when_unenabled_in_django(
+    sentry_init, client, capture_exceptions, capture_events
+):
+    """
+    Test that ensures if django settings.USE_X_FORWARDED_HOST is set to False
+    then the SDK sets the request url to the `HTTP_POST`
+    """
+    sentry_init(integrations=[DjangoIntegration()], send_default_pii=True)
+    exceptions = capture_exceptions()
+    events = capture_events()
+    client.get(reverse("view_exc"), headers={"X_FORWARDED_HOST": "example.com"})
+
+    (error,) = exceptions
+    assert isinstance(error, ZeroDivisionError)
+
+    (event,) = events
+    assert event["request"]["url"] == "http://localhost/view-exc"
 
 
 def test_middleware_exceptions(sentry_init, client, capture_exceptions):
@@ -44,7 +85,7 @@ def test_middleware_exceptions(sentry_init, client, capture_exceptions):
     exceptions = capture_exceptions()
     client.get(reverse("middleware_exc"))
 
-    error, = exceptions
+    (error,) = exceptions
     assert isinstance(error, ZeroDivisionError)
 
 
@@ -54,7 +95,7 @@ def test_request_captured(sentry_init, client, capture_events):
     content, status, headers = client.get(reverse("message"))
     assert b"".join(content) == b"ok"
 
-    event, = events
+    (event,) = events
     assert event["transaction"] == "/message"
     assert event["request"] == {
         "cookies": {},
@@ -75,7 +116,7 @@ def test_transaction_with_class_view(sentry_init, client, capture_events):
     content, status, headers = client.head(reverse("classbased"))
     assert status.lower() == "200 ok"
 
-    event, = events
+    (event,) = events
 
     assert (
         event["transaction"] == "tests.integrations.django.myapp.views.ClassBasedView"
@@ -96,7 +137,7 @@ def test_user_captured(sentry_init, client, capture_events):
     content, status, headers = client.get(reverse("message"))
     assert b"".join(content) == b"ok"
 
-    event, = events
+    (event,) = events
 
     assert event["user"] == {
         "email": "lennon@thebeatles.com",
@@ -118,11 +159,11 @@ def test_queryset_repr(sentry_init, capture_events):
     except Exception:
         capture_exception()
 
-    event, = events
+    (event,) = events
 
-    exception, = event["exception"]["values"]
+    (exception,) = event["exception"]["values"]
     assert exception["type"] == "ZeroDivisionError"
-    frame, = exception["stacktrace"]["frames"]
+    (frame,) = exception["stacktrace"]["frames"]
     assert frame["vars"]["my_queryset"].startswith(
         "<QuerySet from django.db.models.query at"
     )
@@ -134,7 +175,7 @@ def test_custom_error_handler_request_context(sentry_init, client, capture_event
     content, status, headers = client.post("/404")
     assert status.lower() == "404 not found"
 
-    event, = events
+    (event,) = events
 
     assert event["message"] == "not found"
     assert event["level"] == "error"
@@ -155,7 +196,7 @@ def test_500(sentry_init, client, capture_events):
     assert status.lower() == "500 internal server error"
     content = b"".join(content).decode("utf-8")
 
-    event, = events
+    (event,) = events
     event_id = event["event_id"]
     assert content == "Sentry error: %s" % event_id
 
@@ -181,15 +222,12 @@ def test_sql_queries(sentry_init, capture_events, with_integration):
 
     from django.db import connection
 
-    sentry_init(
-        integrations=[DjangoIntegration()],
-        send_default_pii=True,
-        _experiments={"record_sql_params": True},
-    )
-
     events = capture_events()
 
     sql = connection.cursor()
+
+    with configure_scope() as scope:
+        scope.clear_breadcrumbs()
 
     with pytest.raises(OperationalError):
         # table doesn't even exist
@@ -197,10 +235,10 @@ def test_sql_queries(sentry_init, capture_events, with_integration):
 
     capture_message("HI")
 
-    event, = events
+    (event,) = events
 
     if with_integration:
-        crumb = event["breadcrumbs"][-1]
+        crumb = event["breadcrumbs"]["values"][-1]
 
         assert crumb["message"] == "SELECT count(*) FROM people_person WHERE foo = %s"
         assert crumb["data"]["db.params"] == [123]
@@ -223,6 +261,9 @@ def test_sql_dict_query_params(sentry_init, capture_events):
     sql = connections["postgres"].cursor()
 
     events = capture_events()
+    with configure_scope() as scope:
+        scope.clear_breadcrumbs()
+
     with pytest.raises(ProgrammingError):
         sql.execute(
             """SELECT count(*) FROM people_person WHERE foo = %(my_foo)s""",
@@ -230,9 +271,9 @@ def test_sql_dict_query_params(sentry_init, capture_events):
         )
 
     capture_message("HI")
-    event, = events
+    (event,) = events
 
-    crumb = event["breadcrumbs"][-1]
+    crumb = event["breadcrumbs"]["values"][-1]
     assert crumb["message"] == (
         "SELECT count(*) FROM people_person WHERE foo = %(my_foo)s"
     )
@@ -265,14 +306,18 @@ def test_sql_psycopg2_string_composition(sentry_init, capture_events, query):
 
     sql = connections["postgres"].cursor()
 
+    with configure_scope() as scope:
+        scope.clear_breadcrumbs()
+
     events = capture_events()
+
     with pytest.raises(ProgrammingError):
         sql.execute(query(psycopg2.sql), {"my_param": 10})
 
     capture_message("HI")
 
-    event, = events
-    crumb = event["breadcrumbs"][-1]
+    (event,) = events
+    crumb = event["breadcrumbs"]["values"][-1]
     assert crumb["message"] == ('SELECT %(my_param)s FROM "foobar"')
     assert crumb["data"]["db.params"] == {"my_param": 10}
 
@@ -295,6 +340,9 @@ def test_sql_psycopg2_placeholders(sentry_init, capture_events):
     sql = connections["postgres"].cursor()
 
     events = capture_events()
+    with configure_scope() as scope:
+        scope.clear_breadcrumbs()
+
     with pytest.raises(DataError):
         names = ["foo", "bar"]
         identifiers = [psycopg2.sql.Identifier(name) for name in names]
@@ -311,11 +359,11 @@ def test_sql_psycopg2_placeholders(sentry_init, capture_events):
 
     capture_message("HI")
 
-    event, = events
-    for crumb in event["breadcrumbs"]:
+    (event,) = events
+    for crumb in event["breadcrumbs"]["values"]:
         del crumb["timestamp"]
 
-    assert event["breadcrumbs"][-2:] == [
+    assert event["breadcrumbs"]["values"][-2:] == [
         {
             "category": "query",
             "data": {"db.paramstyle": "format"},
@@ -353,7 +401,7 @@ def test_transaction_style(
     content, status, headers = client.get(reverse("message"))
     assert b"".join(content) == b"ok"
 
-    event, = events
+    (event,) = events
     assert event["transaction"] == expected_transaction
 
 
@@ -366,7 +414,7 @@ def test_request_body(sentry_init, client, capture_events):
     assert status.lower() == "200 ok"
     assert b"".join(content) == b"heyooo"
 
-    event, = events
+    (event,) = events
 
     assert event["message"] == "hi"
     assert event["request"]["data"] == ""
@@ -383,7 +431,7 @@ def test_request_body(sentry_init, client, capture_events):
     assert status.lower() == "200 ok"
     assert b"".join(content) == b'{"hey": 42}'
 
-    event, = events
+    (event,) = events
 
     assert event["message"] == "hi"
     assert event["request"]["data"] == {"hey": 42}
@@ -403,19 +451,22 @@ def test_read_request(sentry_init, client, capture_events):
 
     assert status.lower() == "500 internal server error"
 
-    event, = events
+    (event,) = events
 
     assert "data" not in event["request"]
 
 
-def test_template_exception(sentry_init, client, capture_events):
-    sentry_init(integrations=[DjangoIntegration()])
+@pytest.mark.parametrize("with_executing_integration", [[], [ExecutingIntegration()]])
+def test_template_exception(
+    sentry_init, client, capture_events, with_executing_integration
+):
+    sentry_init(integrations=[DjangoIntegration()] + with_executing_integration)
     events = capture_events()
 
     content, status, headers = client.get(reverse("template_exc"))
     assert status.lower() == "500 internal server error"
 
-    event, = events
+    (event,) = events
     exception = event["exception"]["values"][-1]
     assert exception["type"] == "TemplateSyntaxError"
 
@@ -437,11 +488,19 @@ def test_template_exception(sentry_init, client, capture_events):
     filenames = [
         (f.get("function"), f.get("module")) for f in exception["stacktrace"]["frames"]
     ]
-    assert filenames[-3:] == [
-        (u"parse", u"django.template.base"),
-        (None, None),
-        (u"invalid_block_tag", u"django.template.base"),
-    ]
+
+    if with_executing_integration:
+        assert filenames[-3:] == [
+            (u"Parser.parse", u"django.template.base"),
+            (None, None),
+            (u"Parser.invalid_block_tag", u"django.template.base"),
+        ]
+    else:
+        assert filenames[-3:] == [
+            (u"parse", u"django.template.base"),
+            (None, None),
+            (u"invalid_block_tag", u"django.template.base"),
+        ]
 
 
 @pytest.mark.parametrize(
@@ -473,10 +532,10 @@ def test_rest_framework_basic(
     else:
         assert False
 
-    error, = exceptions
+    (error,) = exceptions
     assert isinstance(error, ZeroDivisionError)
 
-    event, = events
+    (event,) = events
     assert event["exception"]["values"][0]["mechanism"]["type"] == "django"
 
     assert event["request"]["data"] == body
@@ -499,7 +558,33 @@ def test_does_not_capture_403(sentry_init, client, capture_events, endpoint):
     assert not events
 
 
-def test_middleware_spans(sentry_init, client, capture_events):
+def test_render_spans(sentry_init, client, capture_events, render_span_tree):
+    sentry_init(
+        integrations=[DjangoIntegration()],
+        traces_sample_rate=1.0,
+    )
+    views_tests = [
+        (
+            reverse("template_test2"),
+            '- op="django.template.render": description="[user_name.html, ...]"',
+        ),
+    ]
+    if DJANGO_VERSION >= (1, 7):
+        views_tests.append(
+            (
+                reverse("template_test"),
+                '- op="django.template.render": description="user_name.html"',
+            ),
+        )
+
+    for url, expected_line in views_tests:
+        events = capture_events()
+        _content, status, _headers = client.get(url)
+        transaction = events[0]
+        assert expected_line in render_span_tree(transaction)
+
+
+def test_middleware_spans(sentry_init, client, capture_events, render_span_tree):
     sentry_init(
         integrations=[DjangoIntegration()],
         traces_sample_rate=1.0,
@@ -513,26 +598,36 @@ def test_middleware_spans(sentry_init, client, capture_events):
 
     assert message["message"] == "hi"
 
-    for middleware in transaction["spans"]:
-        assert middleware["op"] == "django.middleware"
-
     if DJANGO_VERSION >= (1, 10):
-        reference_value = [
-            "tests.integrations.django.myapp.settings.TestFunctionMiddleware.__call__",
-            "tests.integrations.django.myapp.settings.TestMiddleware.__call__",
-            "django.contrib.auth.middleware.AuthenticationMiddleware.__call__",
-            "django.contrib.sessions.middleware.SessionMiddleware.__call__",
-        ]
-    else:
-        reference_value = [
-            "django.contrib.sessions.middleware.SessionMiddleware.process_request",
-            "django.contrib.auth.middleware.AuthenticationMiddleware.process_request",
-            "tests.integrations.django.myapp.settings.TestMiddleware.process_request",
-            "tests.integrations.django.myapp.settings.TestMiddleware.process_response",
-            "django.contrib.sessions.middleware.SessionMiddleware.process_response",
-        ]
+        assert (
+            render_span_tree(transaction)
+            == """\
+- op="http.server": description=null
+  - op="django.middleware": description="django.contrib.sessions.middleware.SessionMiddleware.__call__"
+    - op="django.middleware": description="django.contrib.auth.middleware.AuthenticationMiddleware.__call__"
+      - op="django.middleware": description="django.middleware.csrf.CsrfViewMiddleware.__call__"
+        - op="django.middleware": description="tests.integrations.django.myapp.settings.TestMiddleware.__call__"
+          - op="django.middleware": description="tests.integrations.django.myapp.settings.TestFunctionMiddleware.__call__"
+            - op="django.middleware": description="django.middleware.csrf.CsrfViewMiddleware.process_view"
+            - op="django.view": description="message"\
+"""
+        )
 
-    assert [t["description"] for t in transaction["spans"]] == reference_value
+    else:
+        assert (
+            render_span_tree(transaction)
+            == """\
+- op="http.server": description=null
+  - op="django.middleware": description="django.contrib.sessions.middleware.SessionMiddleware.process_request"
+  - op="django.middleware": description="django.contrib.auth.middleware.AuthenticationMiddleware.process_request"
+  - op="django.middleware": description="tests.integrations.django.myapp.settings.TestMiddleware.process_request"
+  - op="django.middleware": description="django.middleware.csrf.CsrfViewMiddleware.process_view"
+  - op="django.view": description="message"
+  - op="django.middleware": description="tests.integrations.django.myapp.settings.TestMiddleware.process_response"
+  - op="django.middleware": description="django.middleware.csrf.CsrfViewMiddleware.process_response"
+  - op="django.middleware": description="django.contrib.sessions.middleware.SessionMiddleware.process_response"\
+"""
+        )
 
 
 def test_middleware_spans_disabled(sentry_init, client, capture_events):
@@ -548,3 +643,30 @@ def test_middleware_spans_disabled(sentry_init, client, capture_events):
     assert message["message"] == "hi"
 
     assert not transaction["spans"]
+
+
+def test_csrf(sentry_init, client):
+    """
+    Assert that CSRF view decorator works even with the view wrapped in our own
+    callable.
+    """
+
+    sentry_init(integrations=[DjangoIntegration()])
+
+    content, status, _headers = client.post(reverse("csrf_hello_not_exempt"))
+    assert status.lower() == "403 forbidden"
+
+    content, status, _headers = client.post(reverse("sentryclass_csrf"))
+    assert status.lower() == "403 forbidden"
+
+    content, status, _headers = client.post(reverse("sentryclass"))
+    assert status.lower() == "200 ok"
+    assert b"".join(content) == b"ok"
+
+    content, status, _headers = client.post(reverse("classbased"))
+    assert status.lower() == "200 ok"
+    assert b"".join(content) == b"ok"
+
+    content, status, _headers = client.post(reverse("message"))
+    assert status.lower() == "200 ok"
+    assert b"".join(content) == b"ok"

@@ -5,11 +5,45 @@ import sys
 import threading
 import weakref
 
-from django import VERSION as DJANGO_VERSION
-from django.core import signals
-
 from sentry_sdk._types import MYPY
-from sentry_sdk.utils import HAS_REAL_CONTEXTVARS, logger
+from sentry_sdk.hub import Hub, _should_send_default_pii
+from sentry_sdk.scope import add_global_event_processor
+from sentry_sdk.serializer import add_global_repr_processor
+from sentry_sdk.tracing import record_sql_queries
+from sentry_sdk.utils import (
+    HAS_REAL_CONTEXTVARS,
+    CONTEXTVARS_ERROR_MESSAGE,
+    logger,
+    capture_internal_exceptions,
+    event_from_exception,
+    transaction_from_function,
+    walk_exception_chain,
+)
+from sentry_sdk.integrations import Integration, DidNotEnable
+from sentry_sdk.integrations.logging import ignore_logger
+from sentry_sdk.integrations.wsgi import SentryWsgiMiddleware
+from sentry_sdk.integrations._wsgi_common import RequestExtractor
+
+try:
+    from django import VERSION as DJANGO_VERSION
+    from django.core import signals
+
+    try:
+        from django.urls import resolve
+    except ImportError:
+        from django.core.urlresolvers import resolve
+except ImportError:
+    raise DidNotEnable("Django not installed")
+
+
+from sentry_sdk.integrations.django.transactions import LEGACY_RESOLVER
+from sentry_sdk.integrations.django.templates import (
+    get_template_frame_from_exception,
+    patch_templates,
+)
+from sentry_sdk.integrations.django.middleware import patch_django_middlewares
+from sentry_sdk.integrations.django.views import patch_views
+
 
 if MYPY:
     from typing import Any
@@ -28,31 +62,6 @@ if MYPY:
     from sentry_sdk._types import Event, Hint, EventProcessor, NotImplementedType
 
 
-try:
-    from django.urls import resolve
-except ImportError:
-    from django.core.urlresolvers import resolve
-
-from sentry_sdk import Hub
-from sentry_sdk.hub import _should_send_default_pii
-from sentry_sdk.scope import add_global_event_processor
-from sentry_sdk.serializer import add_global_repr_processor
-from sentry_sdk.tracing import record_sql_queries
-from sentry_sdk.utils import (
-    capture_internal_exceptions,
-    event_from_exception,
-    transaction_from_function,
-    walk_exception_chain,
-)
-from sentry_sdk.integrations import Integration
-from sentry_sdk.integrations.logging import ignore_logger
-from sentry_sdk.integrations.wsgi import SentryWsgiMiddleware
-from sentry_sdk.integrations._wsgi_common import RequestExtractor
-from sentry_sdk.integrations.django.transactions import LEGACY_RESOLVER
-from sentry_sdk.integrations.django.templates import get_template_frame_from_exception
-from sentry_sdk.integrations.django.middleware import patch_django_middlewares
-
-
 if DJANGO_VERSION < (1, 10):
 
     def is_authenticated(request_user):
@@ -67,6 +76,9 @@ else:
         return request_user.is_authenticated
 
 
+TRANSACTION_STYLE_VALUES = ("function_name", "url")
+
+
 class DjangoIntegration(Integration):
     identifier = "django"
 
@@ -75,7 +87,6 @@ class DjangoIntegration(Integration):
 
     def __init__(self, transaction_style="url", middleware_spans=True):
         # type: (str, bool) -> None
-        TRANSACTION_STYLE_VALUES = ("function_name", "url")
         if transaction_style not in TRANSACTION_STYLE_VALUES:
             raise ValueError(
                 "Invalid value for transaction_style: %s (must be in %s)"
@@ -87,6 +98,10 @@ class DjangoIntegration(Integration):
     @staticmethod
     def setup_once():
         # type: () -> None
+
+        if DJANGO_VERSION < (1, 6):
+            raise DidNotEnable("Django 1.6 or newer is required.")
+
         install_sql_hook()
         # Patch in our custom middleware.
 
@@ -105,41 +120,19 @@ class DjangoIntegration(Integration):
 
             bound_old_app = old_app.__get__(self, WSGIHandler)
 
-            return SentryWsgiMiddleware(bound_old_app)(environ, start_response)
+            from django.conf import settings
+
+            use_x_forwarded_for = settings.USE_X_FORWARDED_HOST
+
+            return SentryWsgiMiddleware(bound_old_app, use_x_forwarded_for)(
+                environ, start_response
+            )
 
         WSGIHandler.__call__ = sentry_patched_wsgi_handler
 
-        # patch get_response, because at that point we have the Django request
-        # object
-        from django.core.handlers.base import BaseHandler
+        _patch_get_response()
 
-        old_get_response = BaseHandler.get_response
-
-        def sentry_patched_get_response(self, request):
-            # type: (Any, WSGIRequest) -> Union[HttpResponse, BaseException]
-            hub = Hub.current
-            integration = hub.get_integration(DjangoIntegration)
-            if integration is not None:
-                _patch_drf()
-
-                with hub.configure_scope() as scope:
-                    # Rely on WSGI middleware to start a trace
-                    try:
-                        if integration.transaction_style == "function_name":
-                            scope.transaction = transaction_from_function(
-                                resolve(request.path).func
-                            )
-                        elif integration.transaction_style == "url":
-                            scope.transaction = LEGACY_RESOLVER.resolve(request.path)
-                    except Exception:
-                        pass
-
-                    scope.add_event_processor(
-                        _make_event_processor(weakref.ref(request), integration)
-                    )
-            return old_get_response(self, request)
-
-        BaseHandler.get_response = sentry_patched_get_response
+        _patch_django_asgi_handler()
 
         signals.got_request_exception.connect(_got_request_exception)
 
@@ -174,7 +167,7 @@ class DjangoIntegration(Integration):
                     for i in reversed(range(len(frames))):
                         f = frames[i]
                         if (
-                            f.get("function") in ("parse", "render")
+                            f.get("function") in ("Parser.parse", "parse", "render")
                             and f.get("module") == "django.template.base"
                         ):
                             i += 1
@@ -216,6 +209,8 @@ class DjangoIntegration(Integration):
 
         _patch_channels()
         patch_django_middlewares()
+        patch_views()
+        patch_templates()
 
 
 _DRF_PATCHED = False
@@ -289,29 +284,88 @@ def _patch_channels():
         # requests.
         #
         # We cannot hard-raise here because channels may not be used at all in
-        # the current process.
+        # the current process. That is the case when running traditional WSGI
+        # workers in gunicorn+gevent and the websocket stuff in a separate
+        # process.
         logger.warning(
-            "We detected that you are using Django channels 2.0. To get proper "
-            "instrumentation for ASGI requests, the Sentry SDK requires "
-            "Python 3.7+ or the aiocontextvars package from PyPI."
+            "We detected that you are using Django channels 2.0."
+            + CONTEXTVARS_ERROR_MESSAGE
         )
 
-    from sentry_sdk.integrations.asgi import SentryAsgiMiddleware
+    from sentry_sdk.integrations.django.asgi import patch_channels_asgi_handler_impl
 
-    old_app = AsgiHandler.__call__
+    patch_channels_asgi_handler_impl(AsgiHandler)
 
-    def sentry_patched_asgi_handler(self, receive, send):
-        # type: (AsgiHandler, Any, Any) -> Any
-        if Hub.current.get_integration(DjangoIntegration) is None:
-            return old_app(receive, send)
 
-        middleware = SentryAsgiMiddleware(
-            lambda _scope: old_app.__get__(self, AsgiHandler)
+def _patch_django_asgi_handler():
+    # type: () -> None
+    try:
+        from django.core.handlers.asgi import ASGIHandler
+    except ImportError:
+        return
+
+    if not HAS_REAL_CONTEXTVARS:
+        # We better have contextvars or we're going to leak state between
+        # requests.
+        #
+        # We cannot hard-raise here because Django's ASGI stuff may not be used
+        # at all.
+        logger.warning(
+            "We detected that you are using Django 3." + CONTEXTVARS_ERROR_MESSAGE
         )
 
-        return middleware(self.scope)(receive, send)
+    from sentry_sdk.integrations.django.asgi import patch_django_asgi_handler_impl
 
-    AsgiHandler.__call__ = sentry_patched_asgi_handler
+    patch_django_asgi_handler_impl(ASGIHandler)
+
+
+def _before_get_response(request):
+    # type: (WSGIRequest) -> None
+    hub = Hub.current
+    integration = hub.get_integration(DjangoIntegration)
+    if integration is None:
+        return
+
+    _patch_drf()
+
+    with hub.configure_scope() as scope:
+        # Rely on WSGI middleware to start a trace
+        try:
+            if integration.transaction_style == "function_name":
+                fn = resolve(request.path).func
+                scope.transaction = transaction_from_function(
+                    getattr(fn, "view_class", fn)
+                )
+            elif integration.transaction_style == "url":
+                scope.transaction = LEGACY_RESOLVER.resolve(request.path_info)
+        except Exception:
+            pass
+
+        scope.add_event_processor(
+            _make_event_processor(weakref.ref(request), integration)
+        )
+
+
+def _patch_get_response():
+    # type: () -> None
+    """
+    patch get_response, because at that point we have the Django request object
+    """
+    from django.core.handlers.base import BaseHandler
+
+    old_get_response = BaseHandler.get_response
+
+    def sentry_patched_get_response(self, request):
+        # type: (Any, WSGIRequest) -> Union[HttpResponse, BaseException]
+        _before_get_response(request)
+        return old_get_response(self, request)
+
+    BaseHandler.get_response = sentry_patched_get_response
+
+    if hasattr(BaseHandler, "get_response_async"):
+        from sentry_sdk.integrations.django.asgi import patch_get_response_async
+
+        patch_get_response_async(BaseHandler, _before_get_response)
 
 
 def _make_event_processor(weak_request, integration):
@@ -404,17 +458,17 @@ def _set_user_info(request, event):
         return
 
     try:
-        user_info["id"] = str(user.pk)
+        user_info.setdefault("id", str(user.pk))
     except Exception:
         pass
 
     try:
-        user_info["email"] = user.email
+        user_info.setdefault("email", user.email)
     except Exception:
         pass
 
     try:
-        user_info["username"] = user.get_username()
+        user_info.setdefault("username", user.get_username())
     except Exception:
         pass
 

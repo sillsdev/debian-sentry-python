@@ -1,3 +1,4 @@
+import os
 import logging
 
 import pytest
@@ -6,12 +7,15 @@ from sentry_sdk import (
     Client,
     push_scope,
     configure_scope,
+    capture_event,
     capture_exception,
     capture_message,
     add_breadcrumb,
     last_event_id,
     Hub,
 )
+
+from sentry_sdk.integrations import _AUTO_ENABLING_INTEGRATIONS
 from sentry_sdk.integrations.logging import LoggingIntegration
 
 
@@ -32,9 +36,23 @@ def test_processors(sentry_init, capture_events):
     except Exception:
         capture_exception()
 
-    event, = events
+    (event,) = events
 
     assert event["exception"]["values"][0]["value"] == "aha! whatever"
+
+
+def test_auto_enabling_integrations_catches_import_error(sentry_init, caplog):
+    caplog.set_level(logging.DEBUG)
+
+    sentry_init(auto_enabling_integrations=True, debug=True)
+
+    for import_string in _AUTO_ENABLING_INTEGRATIONS:
+        assert any(
+            record.message.startswith(
+                "Did not import default integration {}:".format(import_string)
+            )
+            for record in caplog.records
+        )
 
 
 def test_event_id(sentry_init, capture_events):
@@ -48,7 +66,7 @@ def test_event_id(sentry_init, capture_events):
         int(event_id, 16)
         assert len(event_id) == 32
 
-    event, = events
+    (event,) = events
     assert event["event_id"] == event_id
     assert last_event_id() == event_id
     assert Hub.current.last_event_id() == event_id
@@ -89,7 +107,7 @@ def test_option_callback(sentry_init, capture_events):
     normal, no_crumbs = events
 
     assert normal["exception"]["values"][0]["type"] == "ValueError"
-    crumb, = normal["breadcrumbs"]
+    (crumb,) = normal["breadcrumbs"]["values"]
     assert "timestamp" in crumb
     assert crumb["message"] == "Hello"
     assert crumb["data"] == {"foo": "bar"}
@@ -126,7 +144,7 @@ def test_push_scope(sentry_init, capture_events):
         except Exception as e:
             capture_exception(e)
 
-    event, = events
+    (event,) = events
 
     assert event["level"] == "warning"
     assert "exception" in event
@@ -155,13 +173,13 @@ def test_push_scope_callback(sentry_init, null_client, capture_events):
     if null_client:
         Hub.current.bind_client(None)
 
-    outer_scope = Hub.current._stack[-1][1]
+    outer_scope = Hub.current.scope
 
     calls = []
 
     @push_scope
     def _(scope):
-        assert scope is Hub.current._stack[-1][1]
+        assert scope is Hub.current.scope
         assert scope is not outer_scope
         calls.append(1)
 
@@ -171,7 +189,7 @@ def test_push_scope_callback(sentry_init, null_client, capture_events):
     assert calls == [1]
 
     # Assert scope gets popped correctly
-    assert Hub.current._stack[-1][1] is outer_scope
+    assert Hub.current.scope is outer_scope
 
 
 def test_breadcrumbs(sentry_init, capture_events):
@@ -184,11 +202,11 @@ def test_breadcrumbs(sentry_init, capture_events):
         )
 
     capture_exception(ValueError())
-    event, = events
+    (event,) = events
 
-    assert len(event["breadcrumbs"]) == 10
-    assert "user 10" in event["breadcrumbs"][0]["message"]
-    assert "user 19" in event["breadcrumbs"][-1]["message"]
+    assert len(event["breadcrumbs"]["values"]) == 10
+    assert "user 10" in event["breadcrumbs"]["values"][0]["message"]
+    assert "user 19" in event["breadcrumbs"]["values"][-1]["message"]
 
     del events[:]
 
@@ -201,8 +219,41 @@ def test_breadcrumbs(sentry_init, capture_events):
         scope.clear()
 
     capture_exception(ValueError())
-    event, = events
-    assert len(event["breadcrumbs"]) == 0
+    (event,) = events
+    assert len(event["breadcrumbs"]["values"]) == 0
+
+
+def test_attachments(sentry_init, capture_envelopes):
+    sentry_init()
+    envelopes = capture_envelopes()
+
+    this_file = os.path.abspath(__file__.rstrip("c"))
+
+    with configure_scope() as scope:
+        scope.add_attachment(bytes=b"Hello World!", filename="message.txt")
+        scope.add_attachment(path=this_file)
+
+    capture_exception(ValueError())
+
+    (envelope,) = envelopes
+
+    assert len(envelope.items) == 3
+    assert envelope.get_event()["exception"] is not None
+
+    attachments = [x for x in envelope.items if x.type == "attachment"]
+    (message, pyfile) = attachments
+
+    assert message.headers["filename"] == "message.txt"
+    assert message.headers["type"] == "attachment"
+    assert message.headers["content_type"] == "text/plain"
+    assert message.payload.bytes == message.payload.get_bytes() == b"Hello World!"
+
+    assert pyfile.headers["filename"] == os.path.basename(this_file)
+    assert pyfile.headers["type"] == "attachment"
+    assert pyfile.headers["content_type"].startswith("text/")
+    assert pyfile.payload.bytes is None
+    with open(this_file, "rb") as f:
+        assert pyfile.payload.get_bytes() == f.read()
 
 
 def test_integration_scoping(sentry_init, capture_events):
@@ -230,7 +281,7 @@ def test_client_initialized_within_scope(sentry_init, caplog):
     with push_scope():
         Hub.current.bind_client(Client())
 
-    record, = (x for x in caplog.records if x.levelname == "WARNING")
+    (record,) = (x for x in caplog.records if x.levelname == "WARNING")
 
     assert record.msg.startswith("init() called inside of pushed scope.")
 
@@ -247,7 +298,7 @@ def test_scope_leaks_cleaned_up(sentry_init, caplog):
 
     assert Hub.current._stack == old_stack
 
-    record, = (x for x in caplog.records if x.levelname == "WARNING")
+    (record,) = (x for x in caplog.records if x.levelname == "WARNING")
 
     assert record.message.startswith("Leaked 1 scopes:")
 
@@ -264,7 +315,7 @@ def test_scope_popped_too_soon(sentry_init, caplog):
 
     assert Hub.current._stack == old_stack
 
-    record, = (x for x in caplog.records if x.levelname == "ERROR")
+    (record,) = (x for x in caplog.records if x.levelname == "ERROR")
 
     assert record.message == ("Scope popped too soon. Popped 1 scopes too many.")
 
@@ -293,6 +344,15 @@ def test_scope_event_processor_order(sentry_init, capture_events):
 
             capture_message("hi")
 
-    event, = events
+    (event,) = events
 
     assert event["message"] == "hifoobarbaz"
+
+
+def test_capture_event_with_scope_kwargs(sentry_init, capture_events):
+    sentry_init(debug=True)
+    events = capture_events()
+    capture_event({}, level="info", extras={"foo": "bar"})
+    (event,) = events
+    assert event["level"] == "info"
+    assert event["extra"]["foo"] == "bar"
