@@ -10,12 +10,19 @@ export PYBUILD_TEST_ARGS=-k '\
 	not test_httplib_misuse and \
 	not test_crumb_capture and \
 	not test_errors and \
-	not test_proxy_bothselect_httpenv and \
-	not test_proxy_httpselect_httpsenv and \
-	not test_proxy_none_noenv and \
-	not test_proxy_http_fallback_http and \
-	not test_proxy_none_httpenv_fallback and \
-	not test_transport_works \
+	not test_proxy and \
+	not test_transport_works and \
+	not test_transport_infinite_loop and \
+	not test_simple_rate_limits and \
+	not test_data_category_limits and \
+	not test_complex_limits_without_data_category and \
+	not test_handled_exception and \
+	not test_unhandled_exception and \
+	not test_timeout_error and \
+	not test_performance_no_error and \
+	not test_performance_error and \
+	not test_traces_sampler_gets_correct_values_in_sampling_context and \
+	not test_session_mode_defaults_to_request_mode_in_wsgi_handler \
 	'
 # Remove directory created while running tests on build
 export PYBUILD_AFTER_INSTALL_python3=rm -rf {destdir}/usr/lib/python3*/dist-packages/.hypothesis
