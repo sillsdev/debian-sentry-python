@@ -1,8 +1,8 @@
-sentry-python (1.1.0-2) UNRELEASED; urgency=medium
+sentry-python (1.3.0-2) UNRELEASED; urgency=medium
 
-  * New upstream version 1.1.0 (Closes: #990232)
+  * New upstream version 1.3.0 (Closes: #990232)
 
- -- Eberhard Beilharz <eb1@sil.org>  Thu, 01 Jul 2021 11:33:55 +0200
+ -- Eberhard Beilharz <eb1@sil.org>  Thu, 08 Jul 2021 19:35:47 +0200
 
 sentry-python (0.13.2-1) unstable; urgency=medium
 
