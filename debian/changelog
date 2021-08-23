@@ -1,11 +1,11 @@
-sentry-python (1.3.0-3) UNRELEASED; urgency=medium
+sentry-python (1.3.1-1) unstable; urgency=medium
 
   * Team Upload.
 
   [ Eberhard Beilharz ]
-  * New upstream version 1.3.0 (Closes: #990232)
+  * New upstream release 1.3.1 (Closes: #990232)
 
- -- Eberhard Beilharz <eb1@sil.org>  Fri, 09 Jul 2021 12:31:45 +0200
+ -- Eberhard Beilharz <eb1@sil.org>  Mon, 23 Aug 2021 18:53:09 +0200
 
 sentry-python (0.13.2-1) unstable; urgency=medium
 
