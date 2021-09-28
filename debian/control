@@ -3,7 +3,7 @@ Section: python
 Priority: optional
 Maintainer: Debian Python Team <team+python@tracker.debian.org>
 Uploaders: William Grzybowski <william@grzy.org>
-Build-Depends: debhelper-compat (= 13),
+Build-Depends: debhelper-compat (= 12),
                dh-python,
                python3-all,
                python3-blinker,
@@ -19,7 +19,6 @@ Build-Depends: debhelper-compat (= 13),
                python3-urllib3,
                python3-werkzeug,
                python3-jsonschema,
-               python3-executing,
                python3-asttokens
 Standards-Version: 4.5.1
 Homepage: https://github.com/getsentry/sentry-python
